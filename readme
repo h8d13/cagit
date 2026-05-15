@@ -1,6 +1,6 @@
-promise was simple
+# git-hasht
 
-take a repo with hunderds of thousands of commits (used git/git as example):
+take a repo with hundreds of thousands of commits (used git/git as example):
 300MiB delta-compressed results in GBs of full history.
 
 we want to be able to parse this as effeciently as possible.
