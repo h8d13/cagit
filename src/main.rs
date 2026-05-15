@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
@@ -87,42 +86,42 @@ fn main() {
             results.len() < scan_limit
         });
     } else {
-        // find all matched pack+idx pairs
+        // for each .pack, find the sibling .idx by extension swap
         let pack_dir = git_dir.join("objects/pack");
-        let mut pairs: HashMap<String, (Option<PathBuf>, Option<PathBuf>)> = HashMap::new();
+        let mut pack_paths: Vec<PathBuf> = Vec::new();
         if let Ok(rd) = pack_dir.read_dir() {
             for e in rd.filter_map(|e| e.ok()) {
                 let p = e.path();
-                let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                match p.extension().and_then(|s| s.to_str()) {
-                    Some("pack") => pairs.entry(stem).or_default().0 = Some(p),
-                    Some("idx")  => pairs.entry(stem).or_default().1 = Some(p),
-                    _ => {}
+                if p.extension().and_then(|s| s.to_str()) == Some("pack") {
+                    pack_paths.push(p);
                 }
             }
         }
 
-        if pairs.is_empty() {
+        if pack_paths.is_empty() {
             eprintln!("no pack files found in {}", pack_dir.display());
             std::process::exit(1);
         }
 
-        for (_, (pack_path, idx_path)) in &pairs {
+        for pp in &pack_paths {
             if results.len() >= scan_limit { break; }
-            let (Some(pp), Some(ip)) = (pack_path, idx_path) else { continue };
+            let ip = pp.with_extension("idx");
+            if !ip.exists() { continue; }
             let pack = match std::fs::File::open(pp).and_then(|f| unsafe { Mmap::map(&f) }) {
                 Ok(m)  => m,
                 Err(e) => { eprintln!("mmap {}: {e}", pp.display()); continue }
             };
-            let idx = match std::fs::File::open(ip).and_then(|f| unsafe { Mmap::map(&f) }) {
+            let idx = match std::fs::File::open(&ip).and_then(|f| unsafe { Mmap::map(&f) }) {
                 Ok(m)  => m,
                 Err(e) => { eprintln!("mmap {}: {e}", ip.display()); continue }
             };
-            let shas = idx_sha_map(&idx);
+            let (sha_slab, sha_index) = idx_sha_map(&idx);
 
             let _ = scan_objects(&pack, &idx, kind_mask, |kind, data, offset| {
                 if !re.is_match(data) { return true; }
-                let sha40 = shas.get(&offset).map(hex40).unwrap_or_else(|| "?".repeat(40));
+                let sha40 = sha_index.get(offset)
+                    .map(|i| hex40(&sha_slab[i as usize]))
+                    .unwrap_or_else(|| "?".repeat(40));
                 let summ  = if summary { make_summary(kind, data, &re) } else { String::new() };
                 let ts    = if kind == 1 { commit_timestamp(data) } else { 0 };
                 results.push((ts, sha40, kind, summ));

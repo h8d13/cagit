@@ -10,7 +10,7 @@
 //        git/Documentation/technical/bitmap-format.txt
 //        git/Documentation/technical/pack-format.txt (MIDX section)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::{self, Read as _};
 
 use flate2::read::ZlibDecoder;
@@ -29,12 +29,17 @@ const PACK_MAGIC: &[u8; 4] = b"PACK";
 /// Pass 1: header-only scan via .idx offsets, collects OFS_DELTA base offsets.
 /// Pass 2: sequential scan, each object decompressed exactly once.
 ///         Non-bases yielded then discarded. Bases kept in slab for delta apply.
-pub fn idx_sha_map(idx: &[u8]) -> HashMap<u64, [u8; 20]> {
+/// Returns (slab of 20-byte SHAs, offset -> slab-index map).
+/// Slab + FFI OffsetMap replaces std HashMap<u64, [u8; 20]> (20-byte value
+/// doesn't fit our u64->u64 / u64->u32 maps).
+pub fn idx_sha_map(idx: &[u8]) -> (Vec<[u8; 20]>, OffsetMap) {
     let n = u32_be(idx, 8 + 255 * 4) as usize;
     let sha_base  = 8 + 256 * 4;
     let soff_base = sha_base + n * 20 + n * 4;
     let loff_base = soff_base + n * 4;
-    let mut map = HashMap::with_capacity(n);
+    let mut slab: Vec<[u8; 20]> = Vec::with_capacity(n);
+    let mut map = OffsetMap::new(n.next_power_of_two().max(16));
+    map.reserve(n as u64);
     for i in 0..n {
         let raw = u32_be(idx, soff_base + i * 4);
         let offset = if raw & 0x8000_0000 != 0 {
@@ -43,9 +48,10 @@ pub fn idx_sha_map(idx: &[u8]) -> HashMap<u64, [u8; 20]> {
             raw as u64
         };
         let sha: [u8; 20] = idx[sha_base + i * 20..sha_base + i * 20 + 20].try_into().unwrap();
-        map.insert(offset, sha);
+        map.set(offset, slab.len() as u32);
+        slab.push(sha);
     }
-    map
+    (slab, map)
 }
 
 /// Callback returns `true` to continue scanning, `false` to stop immediately.
