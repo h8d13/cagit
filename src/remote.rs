@@ -114,7 +114,18 @@ fn demux_sideband(data: &[u8]) -> io::Result<Vec<u8>> {
     let mut pos = 0;
     let mut pack = Vec::new();
     loop {
-        let Some(pkt) = read_pkt_line(data, &mut pos) else { break };
+        let pkt = match read_pkt_line(data, &mut pos) {
+            Some(p) => p,
+            None => {
+                if pos < data.len() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("truncated pkt-line at byte {pos}/{}", data.len()),
+                    ));
+                }
+                break;
+            }
+        };
         if pkt.is_empty() { continue; }
         match pkt[0] {
             1 => pack.extend_from_slice(&pkt[1..]),

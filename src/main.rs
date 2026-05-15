@@ -1,5 +1,5 @@
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cagit::pack_scan::{idx_sha_map, scan_objects, scan_objects_no_idx};
 use cagit::remote::fetch_pack;
@@ -7,8 +7,9 @@ use memmap2::Mmap;
 use regex::bytes::Regex;
 
 fn print_usage() {
-    eprintln!("usage: cagit <repo> <type> <query> [-e|--exact] [-s|--summary] [oldest|newest|N]");
+    eprintln!("usage: cagit <repo> <type|find> <query|sha> [-e|--exact] [-s|--summary] [oldest|newest|N]");
     eprintln!("  type:               blob | commit | tree | tag | all");
+    eprintln!("  find <sha> [N]:     N oldest commits whose tree contains <sha> (default N=1)");
     eprintln!("  -e, --exact:        exact word match (wraps query in \\b(?:...)\\b)");
     eprintln!("  -s, --summary:      show one-line summary (default: sha + kind only)");
     eprintln!("  oldest|newest:      sort commits by author date, show 10");
@@ -49,11 +50,22 @@ fn main() {
     }
 
     let repo_path = PathBuf::from(args[1].as_str());
+    let is_remote = args[1].starts_with("https://") || args[1].starts_with("http://");
     let git_dir = if repo_path.join(".git").exists() {
         repo_path.join(".git")
     } else {
         repo_path.clone()
     };
+
+    if args[2].as_str() == "find" {
+        let limit: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
+        if is_remote {
+            run_find_remote(args[1].as_str(), args[3].as_str(), limit, summary);
+        } else {
+            run_find(&git_dir, args[3].as_str(), limit, summary);
+        }
+        return;
+    }
 
     let kind_mask: u8 = match args[2].as_str() {
         "commit" | "commits" => 0b0001,
@@ -84,8 +96,6 @@ fn main() {
         Some(n)        => Order::Scan(n.parse().unwrap_or(10)),
         None           => Order::Scan(10),
     };
-
-    let is_remote = args[1].starts_with("https://") || args[1].starts_with("http://");
 
     // for Scan mode, stop decompressing once we have enough hits
     let scan_limit = match order { Order::Scan(n) => n, _ => usize::MAX };
@@ -253,4 +263,135 @@ fn object_sha(kind: u8, data: &[u8]) -> String {
     h.update(data);
     let bytes = h.digest().bytes();
     hex40(&bytes)
+}
+
+// N oldest commits whose root tree (recursively) contains target. Distinct
+// from `git log --find-object`, which only reports diff-add/remove commits.
+// cagit reports historical containment.
+fn run_find(
+    git_dir: &Path,
+    target_hex: &str,
+    limit: usize,
+    summary: bool,
+) {
+    let Some(target) = cagit::find::hex_to_sha(target_hex) else {
+        eprintln!("invalid target sha: {target_hex}");
+        std::process::exit(1);
+    };
+
+    let pack_dir = git_dir.join("objects/pack");
+    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if let Ok(rd) = pack_dir.read_dir() {
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.extension().and_then(|s| s.to_str()) == Some("pack") {
+                let ip = p.with_extension("idx");
+                if ip.exists() { pairs.push((p, ip)); }
+            }
+        }
+    }
+    if pairs.is_empty() {
+        eprintln!("no pack found in {}", pack_dir.display());
+        std::process::exit(1);
+    }
+
+    // Per-pack: find up to `limit` matches in requested order. Inflate body
+    // eagerly when -s is requested so we can drop the mmap before the next pack.
+    let mut all: Vec<(cagit::find::CommitInfo, Vec<u8>)> = Vec::new();
+    for (pp, ip) in &pairs {
+        let pack = match std::fs::File::open(pp).and_then(|f| unsafe { Mmap::map(&f) }) {
+            Ok(m)  => m,
+            Err(e) => { eprintln!("mmap {}: {e}", pp.display()); continue }
+        };
+        let idx = match std::fs::File::open(ip).and_then(|f| unsafe { Mmap::map(&f) }) {
+            Ok(m)  => m,
+            Err(e) => { eprintln!("mmap {}: {e}", ip.display()); continue }
+        };
+        let sha_idx = cagit::find::ShaIndex::from_idx(&idx);
+        match cagit::find::find_oldest(&pack, &sha_idx, &target, limit) {
+            Ok(results) => for c in results {
+                let body = if summary {
+                    cagit::find::inflate_at(&pack, c.offset).map(|(_, d)| d).unwrap_or_default()
+                } else { Vec::new() };
+                all.push((c, body));
+            },
+            Err(e) => eprintln!("scan {}: {e}", pp.display()),
+        }
+    }
+
+    // Merge across packs: sort oldest-first and truncate.
+    all.sort_by_key(|(c, _)| c.author_ts);
+    all.truncate(limit);
+
+    if all.is_empty() {
+        eprintln!("not found");
+        std::process::exit(1);
+    }
+    for (c, body) in &all {
+        let sha40 = hex40(&c.commit_sha);
+        if summary {
+            println!("{sha40}  commit  {}", commit_summary(body));
+        } else {
+            println!("{sha40}  commit");
+        }
+    }
+}
+
+// Remote variant: fetch full pack (no blob:none filter, since we need to be
+// able to resolve any sha), then build ShaIndex by hashing each object during
+// the walk. Slower upfront than local but otherwise identical logic.
+fn run_find_remote(
+    url: &str,
+    target_hex: &str,
+    limit: usize,
+    summary: bool,
+) {
+    let Some(target) = cagit::find::hex_to_sha(target_hex) else {
+        eprintln!("invalid target sha: {target_hex}");
+        std::process::exit(1);
+    };
+
+    let pack = match fetch_pack(url, 0) { // kind_mask=0 = all, no filter
+        Ok(p)  => p,
+        Err(e) => { eprintln!("fetch: {e}"); std::process::exit(1); }
+    };
+
+    // Walk pack, accumulating (sha, offset) for every object so we can build a
+    // sha->offset index identical to what idx_sha_map gives us locally.
+    let mut pairs: Vec<([u8; 20], u64)> = Vec::new();
+    let mut last_offset: u64 = 0;
+    let mut last_kind: u8 = 0;
+    let res = scan_objects_no_idx(&pack, 0, |kind, data, offset| {
+        let header = format!("{} {}\0", kind_name(kind), data.len());
+        let mut h = sha1_smol::Sha1::new();
+        h.update(header.as_bytes());
+        h.update(data);
+        pairs.push((h.digest().bytes(), offset));
+        last_offset = offset;
+        last_kind = kind;
+        true
+    });
+    if let Err(e) = res {
+        eprintln!("scan: {e} (processed {} objects, last kind={} offset={}, pack {} bytes)",
+                 pairs.len(), last_kind, last_offset, pack.len());
+        std::process::exit(1);
+    }
+
+    let sha_idx = cagit::find::ShaIndex::from_pairs(&pairs);
+    match cagit::find::find_oldest(&pack, &sha_idx, &target, limit) {
+        Ok(results) => {
+            if results.is_empty() { eprintln!("not found"); std::process::exit(1); }
+            for c in &results {
+                let sha40 = hex40(&c.commit_sha);
+                if summary {
+                    let body = cagit::find::inflate_at(&pack, c.offset)
+                        .map(|(_, d)| d).unwrap_or_default();
+                    println!("{sha40}  commit  {}", commit_summary(&body));
+                } else {
+                    println!("{sha40}  commit");
+                }
+            }
+        }
+        Err(e) => { eprintln!("find: {e}"); std::process::exit(1); }
+    }
 }
