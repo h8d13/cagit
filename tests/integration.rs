@@ -7,9 +7,17 @@ fn repo() -> PathBuf {
         Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../git"),
     }
 }
-
+// because testing git/git will takes years and is not realistic for user
+// over local clone they all work fast regardless
 fn remote_url() -> String {
     std::env::var("TEST_GIT_URL")
+        .unwrap_or_else(|_| "https://github.com/h8d13/archinstoo".to_owned())
+}
+
+// Tests that depend on git/git-specific shas (e.g. Linus's initial commit) use
+// this. Override with TEST_GIT_GIT_URL if needed; default is upstream git.
+fn git_git_url() -> String {
+    std::env::var("TEST_GIT_GIT_URL")
         .unwrap_or_else(|_| "https://github.com/git/git.git".to_owned())
 }
 
@@ -249,7 +257,9 @@ fn remote_output_is_well_formed() {
 #[test]
 #[ignore]
 fn remote_sha_matches_local() {
-    let u = remote_url();
+    // This compares URL fetch to local clone — must use the same repo on both
+    // sides. `repo()` is git/git; remote pair is git/git too.
+    let u = git_git_url();
     let r = repo();
 
     let remote = ghash(&[&u,                  "commit", "-se", "cat", "oldest", "1"]);
@@ -275,4 +285,182 @@ fn remote_kind_filter_works() {
     for line in out_lines(&o) {
         assert!(line.contains("  blob"), "non-blob in remote blob results: {line:?}");
     }
+}
+
+// --- find by sha -----------------------------------------------------------
+
+/// Known-old README blob in git/git's history.
+const KNOWN_OLD_README_BLOB: &str = "cee7e435d7e28bb09c9dc39abf50e84358de7a92";
+/// Linus's initial commit in git/git.
+const LINUS_INITIAL_COMMIT: &str = "e83c5163316f89bfbde7d9ab23ca2e25604af290";
+
+#[test]
+fn find_sha_finds_oldest_containing_commit() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "find", KNOWN_OLD_README_BLOB]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let lines = out_lines(&o);
+    assert_eq!(lines.len(), 1, "expected 1 line, got {lines:?}");
+    let mut parts = lines[0].splitn(2, "  ");
+    let sha = parts.next().unwrap_or("");
+    let kind = parts.next().unwrap_or("");
+    assert_eq!(sha.len(), 40);
+    assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+    assert_eq!(kind, "commit");
+}
+
+#[test]
+fn find_invalid_sha_exits_nonzero() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "find", "notasha"]);
+    assert!(!o.status.success());
+}
+
+#[test]
+fn find_sha_limit_caps_output() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "find", KNOWN_OLD_README_BLOB, "3"]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    assert!(out_lines(&o).len() <= 3);
+}
+
+// --- dag -------------------------------------------------------------------
+
+#[test]
+fn dag_bare_prints_stats() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "dag"]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let err = err_str(&o);
+    assert!(err.contains("commits:"));
+    assert!(err.contains("roots:"));
+    assert!(err.contains("merge commits:"));
+}
+
+#[test]
+fn dag_with_sha_prints_per_commit() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "dag", LINUS_INITIAL_COMMIT]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let err = err_str(&o);
+    assert!(err.contains("generation:"));
+    assert!(err.contains("ancestors:"));
+    assert!(err.contains("descendants:"));
+}
+
+#[test]
+fn dag_initial_commit_is_root() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "dag", LINUS_INITIAL_COMMIT]);
+    assert!(o.status.success());
+    let err = err_str(&o);
+    assert!(err.contains("generation:      1"));
+    assert!(err.contains("parents:         0"));
+}
+
+// --- comp-has --------------------------------------------------------------
+
+#[test]
+fn comp_has_known_commit_present() {
+    let r = repo();
+    let p = r.to_str().unwrap();
+    let o = ghash(&["comp-has", LINUS_INITIAL_COMMIT, p]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("  yes"), "expected 'yes', got: {stdout}");
+}
+
+#[test]
+fn comp_has_bogus_sha_absent() {
+    let r = repo();
+    let p = r.to_str().unwrap();
+    let o = ghash(&["comp-has", "0000000000000000000000000000000000000001", p]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("  no"), "expected 'no', got: {stdout}");
+}
+
+// --- comp ------------------------------------------------------------------
+
+#[test]
+fn comp_self_zero_diff() {
+    let r = repo();
+    let p = r.to_str().unwrap();
+    let o = ghash(&["comp", p, p]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("ahead:       0 "), "stdout: {stdout}");
+    assert!(stdout.contains("behind:      0 "), "stdout: {stdout}");
+}
+
+// --- churn -----------------------------------------------------------------
+
+#[test]
+fn churn_self_zero_commits() {
+    let r = repo();
+    let p = r.to_str().unwrap();
+    let o = ghash(&["churn", p, p, "5"]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let err = err_str(&o);
+    assert!(err.contains("diffed 0 commits"), "stderr: {err}");
+}
+
+// --- duper -----------------------------------------------------------------
+
+#[test]
+fn duper_reports_groups() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "duper", "3", "8"]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let err = err_str(&o);
+    assert!(err.contains("files scanned:"));
+    assert!(err.contains("duplicate groups:"));
+}
+
+#[test]
+fn duper_min_lines_clamps_to_two() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "duper", "1", "1"]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+}
+
+// --- landed ----------------------------------------------------------------
+
+#[test]
+fn landed_unrelated_sha_fails() {
+    let r = repo();
+    let o = ghash(&[r.to_str().unwrap(), "landed",
+                    "0000000000000000000000000000000000000001"]);
+    assert!(!o.status.success());
+}
+
+// --- URL variants (ignored by default; run with --ignored) ----------------
+
+#[test]
+#[ignore]
+fn url_dag_works() {
+    let u = remote_url();
+    let o = ghash(&[&u, "dag"]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("commits:"));
+}
+
+#[test]
+#[ignore]
+fn url_comp_self() {
+    let u = remote_url();
+    let o = ghash(&["comp", &u, &u]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("ahead:       0 "));
+}
+
+#[test]
+#[ignore]
+fn url_comp_has_present() {
+    // Linus's initial commit only exists in git/git, so this must hit git/git.
+    let u = git_git_url();
+    let o = ghash(&["comp-has", LINUS_INITIAL_COMMIT, &u]);
+    assert!(o.status.success(), "stderr: {}", err_str(&o));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("  yes"));
 }

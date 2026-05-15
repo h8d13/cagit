@@ -24,9 +24,9 @@ const USAGE: &str = r#"usage:
   cagit <repo> dag [<sha>]
     DAG stats; with sha: gen/ancestors/descendants for that commit
 
-  cagit <repo> integrated <commit_sha> [<head_sha>] [-s|--summary]
-    merge commit that first integrated <commit_sha> into HEAD
-    -s, --summary:      include integrating merge's commit message
+  cagit <repo> landed <commit_sha> [<head_sha>] [-s|--summary]
+    merge commit that first landed <commit_sha> in HEAD's history
+    -s, --summary:      include the landing merge's commit message
 
   cagit comp <base> <target1> [<target2> ...] [-s|--summary]
     N-way ancestor diff + LCA across repos (paths or URLs)
@@ -142,20 +142,12 @@ fn main() {
     }
 
     if args[2].as_str() == "dag" {
-        if is_remote {
-            eprintln!("dag: local only for now");
-            std::process::exit(1);
-        }
         let sha_arg = args.get(3).map(|s| s.as_str());
-        run_dag(&git_dir, args[1].as_str(), sha_arg);
+        run_dag(args[1].as_str(), sha_arg);
         return;
     }
 
     if args[2].as_str() == "duper" {
-        if is_remote {
-            eprintln!("duper: local only for now");
-            std::process::exit(1);
-        }
         let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15);
         let min_lines: usize = args.get(4).and_then(|s| s.parse().ok())
             .unwrap_or(cagit::duper::MIN_LINES).max(2);
@@ -163,26 +155,20 @@ fn main() {
         return;
     }
 
-    if args[2].as_str() == "integrated" {
-        if is_remote {
-            eprintln!("integrated: local only for now");
-            std::process::exit(1);
-        }
-        // `cagit <repo> integrated <commit_sha> [<head_sha>]`
-        // If head_sha omitted, resolve from .git/HEAD.
+    if args[2].as_str() == "landed" {
+        // `cagit <repo> landed <commit_sha> [<head_sha>]`
+        // If head_sha omitted: for local, resolve from .git/HEAD; for remote,
+        // run_landed uses the fetched HEAD from open_repo.
         let commit_hex = args.get(3).map(|s| s.as_str()).unwrap_or_else(|| {
             print_usage();
             std::process::exit(1);
         });
         let head_hex_owned: Option<String> = match args.get(4) {
             Some(s) => Some(s.to_string()),
-            None => resolve_head(&git_dir),
+            None if !is_remote => resolve_head(&git_dir),
+            None => None, // remote: resolved inside run_landed from repo.head_sha
         };
-        let Some(head_hex) = head_hex_owned else {
-            eprintln!("could not resolve HEAD; pass <head_sha> explicitly");
-            std::process::exit(1);
-        };
-        run_integrated(&git_dir, args[1].as_str(), commit_hex, &head_hex, summary);
+        run_landed(args[1].as_str(), commit_hex, head_hex_owned.as_deref(), summary);
         return;
     }
 
@@ -416,7 +402,9 @@ fn pack_slices(repo: &OpenedRepo) -> Vec<&[u8]> { repo.pack_slices() }
 // MIN_LINES (default 3) across HEAD's tree.
 fn run_duper(repo_arg: &str, top_n: usize, min_lines: usize) {
     let t0 = std::time::Instant::now();
-    let repo = match open_repo(repo_arg) {
+    // duper needs blob content; over the wire that means a full pack fetch
+    // (no filter=blob:none).
+    let repo = match cagit::repo::open_repo_full(repo_arg) {
         Ok(r) => r, Err(e) => { eprintln!("{e}"); std::process::exit(1); }
     };
     let t_setup = t0.elapsed();
@@ -653,15 +641,11 @@ fn run_compare(repos: &[&str], summary: bool) {
     }
 }
 
-// Find the merge commit that first integrated <commit_sha> into <head_sha>'s
+// Find the merge commit that first landed <commit_sha> in <head_sha>'s
 // ancestry. Builds the DAG once, then does two BFS (microseconds).
-fn run_integrated(_git_dir: &Path, repo_arg: &str, commit_hex: &str, head_hex: &str, summary: bool) {
+fn run_landed(repo_arg: &str, commit_hex: &str, head_hex_opt: Option<&str>, summary: bool) {
     let Some(commit_sha) = cagit::find::hex_to_sha(commit_hex) else {
         eprintln!("invalid commit sha: {commit_hex}");
-        std::process::exit(1);
-    };
-    let Some(head_sha) = cagit::find::hex_to_sha(head_hex) else {
-        eprintln!("invalid head sha: {head_hex}");
         std::process::exit(1);
     };
 
@@ -671,12 +655,23 @@ fn run_integrated(_git_dir: &Path, repo_arg: &str, commit_hex: &str, head_hex: &
     };
     eprintln!("dag {}: {:?}", if repo.dag_cached { "loaded" } else { "built" }, t0.elapsed());
 
+    // Resolve head: explicit arg wins; otherwise fall back to repo.head_sha
+    // (works for both local resolved-from-.git/HEAD and remote fetched-HEAD).
+    let head_sha: [u8; 20] = match head_hex_opt.and_then(cagit::find::hex_to_sha) {
+        Some(s) => s,
+        None if repo.head_sha != [0u8; 20] => repo.head_sha,
+        None => {
+            eprintln!("could not resolve HEAD; pass <head_sha> explicitly");
+            std::process::exit(1);
+        }
+    };
+
     let Some(commit_i) = repo.dag.index_by_sha(&commit_sha) else {
         eprintln!("commit not in DAG: {commit_hex}");
         std::process::exit(1);
     };
     let Some(head_i) = repo.dag.index_by_sha(&head_sha) else {
-        eprintln!("head not in DAG: {head_hex}");
+        eprintln!("head not in DAG: {}", hex40(&head_sha));
         std::process::exit(1);
     };
 
@@ -704,7 +699,7 @@ fn run_integrated(_git_dir: &Path, repo_arg: &str, commit_hex: &str, head_hex: &
 
 // Build the commit DAG and print stats. If a sha is given, also print
 // per-commit info (generation, ancestor count, descendant count).
-fn run_dag(_git_dir: &Path, repo_arg: &str, sha_arg: Option<&str>) {
+fn run_dag(repo_arg: &str, sha_arg: Option<&str>) {
     let t0 = std::time::Instant::now();
     let repo = match open_repo(repo_arg) {
         Ok(r) => r, Err(e) => { eprintln!("{e}"); std::process::exit(1); }

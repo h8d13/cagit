@@ -76,10 +76,21 @@ pub fn resolve_head(git_dir: &Path) -> Option<String> {
     }
 }
 
-/// Auto-dispatches: URL -> remote fetch, else local clone.
+/// Auto-dispatches: URL -> remote fetch with filter=blob:none (commits + trees),
+/// else local clone (full pack on disk).
 pub fn open_repo(repo_arg: &str) -> io::Result<OpenedRepo> {
     if repo_arg.starts_with("http://") || repo_arg.starts_with("https://") {
         open_remote_repo(repo_arg)
+    } else {
+        open_local_repo(repo_arg)
+    }
+}
+
+/// Like `open_repo` but the remote variant fetches the full pack (no filter).
+/// Use when blob content is needed (e.g., duper).
+pub fn open_repo_full(repo_arg: &str) -> io::Result<OpenedRepo> {
+    if repo_arg.starts_with("http://") || repo_arg.starts_with("https://") {
+        open_remote_repo_with_mask(repo_arg, 0)
     } else {
         open_local_repo(repo_arg)
     }
@@ -132,10 +143,14 @@ pub fn open_local_repo(repo_arg: &str) -> io::Result<OpenedRepo> {
     Ok(OpenedRepo { packs, sha_idxs, dag, head_sha, dag_cached, loose })
 }
 
-/// Remote: one pack fetched over HTTP. kind_mask=0b0001 (commits with
-/// filter=blob:none). Builds ShaIndex by walking + hashing.
+/// Remote with default kind_mask=0b0001 (commits → filter=blob:none on the wire).
 pub fn open_remote_repo(url: &str) -> io::Result<OpenedRepo> {
-    let (head_sha, pack_bytes) = fetch_pack_with_head(url, 0b0001)?;
+    open_remote_repo_with_mask(url, 0b0001)
+}
+
+/// Remote with arbitrary kind_mask. Pass 0 to disable filter and fetch full pack.
+pub fn open_remote_repo_with_mask(url: &str, kind_mask: u8) -> io::Result<OpenedRepo> {
+    let (head_sha, pack_bytes) = fetch_pack_with_head(url, kind_mask)?;
 
     let mut pairs: Vec<([u8; 20], u64)> = Vec::new();
     scan_objects_no_idx(&pack_bytes, 0, |kind, data, offset| {
