@@ -1,7 +1,11 @@
+pub mod churn;
 pub mod dag;
+pub mod duper;
 pub mod ffi;
 pub mod find;
 pub mod offset_map;
 pub mod pack_reader;
 pub mod pack_scan;
 pub mod remote;
+pub mod repo;
+pub mod util;

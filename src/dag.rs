@@ -5,12 +5,74 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, BufWriter, Read as _, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use flate2::read::ZlibDecoder;
 
 use crate::find::{hex_to_sha, inflate_at, resolve_type, CommitInfo, ShaIndex};
 use crate::offset_map::OffsetMap;
+
+/// Derive a stable cache dir for a repo arg (URL or local path).
+/// Layout: <base>/<repo>/. Override base via CAGIT_CACHE_DIR.
+pub fn cache_dir_for(repo_arg: &str) -> PathBuf {
+    let base = std::env::var("CAGIT_CACHE_DIR").unwrap_or_else(|_| "/tmp/cagit-cache".to_string());
+    let repo = if repo_arg.starts_with("http://") || repo_arg.starts_with("https://") {
+        let after_scheme = repo_arg.split("://").nth(1).unwrap_or("");
+        let parts: Vec<&str> = after_scheme.trim_end_matches('/').split('/').collect();
+        parts.last().map(|s| s.trim_end_matches(".git").to_string()).unwrap_or_else(|| "repo".to_string())
+    } else {
+        let p = PathBuf::from(repo_arg);
+        let canon = p.canonicalize().unwrap_or(p);
+        let stripped = if canon.file_name().and_then(|s| s.to_str()) == Some(".git") {
+            canon.parent().unwrap_or(canon.as_path()).to_path_buf()
+        } else {
+            canon
+        };
+        stripped.file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string()
+    };
+    PathBuf::from(base).join(repo)
+}
+
+/// Pack's trailing 20-byte sha = stable content fingerprint.
+pub fn pack_fingerprint(pack: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(40);
+    for b in &pack[pack.len() - 20..] {
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
+}
+
+/// Cache key for a multi-pack repo: concatenate sorted pack fingerprints (each
+/// shortened to 16 hex chars).
+pub fn multi_pack_fingerprint(packs: &[&[u8]]) -> String {
+    let mut parts: Vec<String> = packs.iter().map(|p| pack_fingerprint(p)[..16].to_string()).collect();
+    parts.sort();
+    parts.join("-")
+}
+
+/// Load DAG from cache if present and matching the packs' combined fingerprint;
+/// else build fresh and persist for next time.
+pub fn load_or_build_dag(
+    packs: &[&[u8]],
+    sha_idxs: &[ShaIndex],
+    repo_arg: &str,
+    git_dir: Option<&Path>,
+) -> io::Result<(CommitDag, bool)> {
+    let dir = cache_dir_for(repo_arg);
+    let cache_path = dir.join(format!("{}.dag", multi_pack_fingerprint(packs)));
+    if cache_path.exists() {
+        if let Ok(dag) = CommitDag::load(&cache_path) {
+            return Ok((dag, true));
+        }
+    }
+    let pairs: Vec<(&[u8], &ShaIndex)> = packs.iter().copied()
+        .zip(sha_idxs.iter())
+        .collect();
+    let dag = CommitDag::build(&pairs, git_dir)?;
+    let _ = dag.save(&cache_path);
+    Ok((dag, false))
+}
 
 const CACHE_MAGIC: &[u8; 4] = b"CDAG";
 const CACHE_VERSION: u8 = 3; // multi-pack + loose-commit support
@@ -37,9 +99,9 @@ pub struct CommitDag {
     pub generation: Vec<u32>,
 }
 
-// Walk <git_dir>/objects/<2>/<38> and return (sha, inflated commit body) for
-// every loose commit. Other object types (blob, tree, tag) are skipped.
-pub fn scan_loose_commits(git_dir: &Path) -> io::Result<Vec<([u8; 20], Vec<u8>)>> {
+// Walk <git_dir>/objects/<2>/<38> and return (sha, kind, inflated body) for
+// every loose object. Kind: 1=commit, 2=tree, 3=blob, 4=tag.
+pub fn scan_all_loose(git_dir: &Path) -> io::Result<Vec<([u8; 20], u8, Vec<u8>)>> {
     let mut out = Vec::new();
     let objects = git_dir.join("objects");
     let Ok(rd) = objects.read_dir() else { return Ok(out); };
@@ -58,15 +120,26 @@ pub fn scan_loose_commits(git_dir: &Path) -> io::Result<Vec<([u8; 20], Vec<u8>)>
             let compressed = match std::fs::read(f.path()) { Ok(b) => b, Err(_) => continue };
             let mut decompressed = Vec::new();
             if ZlibDecoder::new(&compressed[..]).read_to_end(&mut decompressed).is_err() { continue; }
-            // header: "<type> <size>\0"
             if let Some(nul) = decompressed.iter().position(|&b| b == 0) {
-                if decompressed[..nul].starts_with(b"commit ") {
-                    out.push((sha, decompressed[nul + 1..].to_vec()));
-                }
+                let header = &decompressed[..nul];
+                let kind: u8 = if header.starts_with(b"commit ") { 1 }
+                          else if header.starts_with(b"tree ")   { 2 }
+                          else if header.starts_with(b"blob ")   { 3 }
+                          else if header.starts_with(b"tag ")    { 4 }
+                          else { continue };
+                out.push((sha, kind, decompressed[nul + 1..].to_vec()));
             }
         }
     }
     Ok(out)
+}
+
+// Back-compat helper used by CommitDag::build: filter to commits only.
+pub fn scan_loose_commits(git_dir: &Path) -> io::Result<Vec<([u8; 20], Vec<u8>)>> {
+    Ok(scan_all_loose(git_dir)?.into_iter()
+        .filter(|(_, k, _)| *k == 1)
+        .map(|(s, _, b)| (s, b))
+        .collect())
 }
 
 fn parse_commit_full(data: &[u8]) -> Option<([u8; 20], i64, Vec<[u8; 20]>)> {
@@ -202,6 +275,11 @@ impl CommitDag {
     /// True if this commit's content lives in a loose object (no pack offset).
     pub fn is_loose(&self, idx: usize) -> bool {
         self.commits[idx].offset & LOOSE_OFFSET_MARK != 0
+    }
+
+    /// First-parent of `idx`, or None for root commits.
+    pub fn first_parent(&self, idx: usize) -> Option<usize> {
+        self.parents[idx].first().map(|&p| p as usize)
     }
 
     /// Get the inflated commit body, transparently handling packed (decoded

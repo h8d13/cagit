@@ -57,6 +57,8 @@ impl ShaIndex {
         Self { slab, map }
     }
 
+    pub fn len(&self) -> usize { self.slab.len() }
+
     /// Build from (sha, offset) pairs (e.g. emitted during a no-idx pack walk).
     pub fn from_pairs(pairs: &[([u8; 20], u64)]) -> Self {
         let n = pairs.len();
@@ -83,6 +85,127 @@ impl ShaIndex {
     }
 
     pub fn slab(&self) -> &[ShaEntry] { &self.slab }
+}
+
+/// Membership set for 20-byte SHAs backed by our FFI hashmap. Same chained-
+/// slab shape as `ShaIndex`, but with no value stored  the FFI map's u32
+/// payload IS the slab idx that leads to the full sha for exact comparison.
+pub struct ShaSet {
+    slab: Vec<ShaSetEntry>,
+    map: OffsetMap,
+}
+
+struct ShaSetEntry {
+    sha: [u8; 20],
+    next: u32,
+}
+
+impl ShaSet {
+    pub fn with_capacity(cap: usize) -> Self {
+        let mut map = OffsetMap::new(cap.next_power_of_two().max(16));
+        map.reserve(cap as u64);
+        Self { slab: Vec::with_capacity(cap), map }
+    }
+
+    pub fn insert(&mut self, sha: &[u8; 20]) {
+        if self.contains(sha) { return; }
+        let k = sha_key(sha);
+        let prev = self.map.get(k).unwrap_or(NO_NEXT);
+        self.map.set(k, self.slab.len() as u32);
+        self.slab.push(ShaSetEntry { sha: *sha, next: prev });
+    }
+
+    pub fn contains(&self, sha: &[u8; 20]) -> bool {
+        let Some(mut idx) = self.map.get(sha_key(sha)) else { return false; };
+        loop {
+            let e = &self.slab[idx as usize];
+            if e.sha == *sha { return true; }
+            if e.next == NO_NEXT { return false; }
+            idx = e.next;
+        }
+    }
+
+    pub fn len(&self) -> usize { self.slab.len() }
+}
+
+// In-memory store for loose objects: sha -> (kind, body). FFI-backed via the
+// same chained-slab pattern as ShaIndex/ShaSet.
+pub struct LooseStore {
+    slab: Vec<LooseEntry>,
+    map: OffsetMap,
+}
+
+struct LooseEntry {
+    sha: [u8; 20],
+    kind: u8,
+    body: Vec<u8>,
+    next: u32,
+}
+
+impl LooseStore {
+    pub fn with_capacity(cap: usize) -> Self {
+        let mut map = OffsetMap::new(cap.next_power_of_two().max(16));
+        map.reserve(cap as u64);
+        Self { slab: Vec::with_capacity(cap), map }
+    }
+
+    pub fn insert(&mut self, sha: [u8; 20], kind: u8, body: Vec<u8>) {
+        // Walk chain; skip if already present.
+        let k = sha_key(&sha);
+        let mut idx_opt = self.map.get(k);
+        while let Some(idx) = idx_opt {
+            if self.slab[idx as usize].sha == sha { return; }
+            let n = self.slab[idx as usize].next;
+            idx_opt = if n == NO_NEXT { None } else { Some(n) };
+        }
+        let prev = self.map.get(k).unwrap_or(NO_NEXT);
+        self.map.set(k, self.slab.len() as u32);
+        self.slab.push(LooseEntry { sha, kind, body, next: prev });
+    }
+
+    pub fn get(&self, sha: &[u8; 20]) -> Option<(u8, &[u8])> {
+        let mut idx_opt = self.map.get(sha_key(sha));
+        while let Some(idx) = idx_opt {
+            let e = &self.slab[idx as usize];
+            if e.sha == *sha { return Some((e.kind, &e.body)); }
+            idx_opt = if e.next == NO_NEXT { None } else { Some(e.next) };
+        }
+        None
+    }
+
+    pub fn len(&self) -> usize { self.slab.len() }
+}
+
+/// Resolve a sha to (kind, body) by trying the pack first via sha_idx, then
+/// falling back to the loose store. Returns None if not found anywhere.
+pub fn resolve_sha(
+    pack: &[u8],
+    sha_idx: &ShaIndex,
+    loose: &LooseStore,
+    sha: &[u8; 20],
+) -> Option<(u8, Vec<u8>)> {
+    if let Some(off) = sha_idx.lookup(sha) {
+        return inflate_at(pack, off).ok();
+    }
+    loose.get(sha).map(|(k, b)| (k, b.to_vec()))
+}
+
+/// Multi-pack variant. Probes each pack's ShaIndex; on hit, inflates from the
+/// corresponding pack. Falls back to loose store if no pack has it.
+pub fn resolve_sha_multi(
+    packs: &[&[u8]],
+    sha_idxs: &[ShaIndex],
+    loose: &LooseStore,
+    sha: &[u8; 20],
+) -> Option<(u8, Vec<u8>)> {
+    for (i, idx) in sha_idxs.iter().enumerate() {
+        if let Some(off) = idx.lookup(sha) {
+            if let Ok(r) = inflate_at(packs[i], off) {
+                return Some(r);
+            }
+        }
+    }
+    loose.get(sha).map(|(k, b)| (k, b.to_vec()))
 }
 
 pub fn inflate_at(pack: &[u8], offset: u64) -> io::Result<(u8, Vec<u8>)> {

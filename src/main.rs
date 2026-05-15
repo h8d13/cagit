@@ -1,37 +1,56 @@
-use std::fmt::Write as _;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use cagit::pack_scan::{idx_sha_map, scan_objects, scan_objects_no_idx};
 use cagit::remote::fetch_pack;
+use cagit::repo::{open_repo, resolve_head, OpenedRepo};
+use cagit::util::{commit_summary, commit_timestamp, hex40, kind_name, object_sha, tag_summary};
 use memmap2::Mmap;
 use regex::bytes::Regex;
 
+const USAGE: &str = r#"usage:
+
+  -- git-aware queries --
+
+  cagit <repo> <type> <query> [-e|--exact] [-s|--summary] [oldest|newest|N]
+    scan pack for objects of <type> matching regex <query>
+    type:               blob | commit | tree | tag | all
+    -e, --exact:        wrap query in \b(?:...)\b for word-boundary match
+    -s, --summary:      include commit/blob/tree/tag summary line
+
+  cagit <repo> find <sha> [N] [-s|--summary]
+    N oldest commits whose tree contains <sha> (default N=1)
+    -s, --summary:      include commit author + first-line message
+
+  cagit <repo> dag [<sha>]
+    DAG stats; with sha: gen/ancestors/descendants for that commit
+
+  cagit <repo> integrated <commit_sha> [<head_sha>] [-s|--summary]
+    merge commit that first integrated <commit_sha> into HEAD
+    -s, --summary:      include integrating merge's commit message
+
+  cagit comp <base> <target1> [<target2> ...] [-s|--summary]
+    N-way ancestor diff + LCA across repos (paths or URLs)
+    -s, --summary:      include LCA commit's message
+
+  cagit comp-has <sha> <repo1> [<repo2> ...] [-s|--summary]
+    yes/no presence of <sha> in each repo (with HEAD-reachability)
+    -s, --summary:      include commit message when found
+
+  cagit churn <base> <fork> [N=20]
+    top-N most-modified paths across commits in fork-not-base
+
+  -- code-content analysis --
+
+  cagit <repo> duper [N=15] [MIN_LINES=3]
+    top-N duplicate code blocks in repo's HEAD tree
+    higher MIN_LINES (5-8) filters out framework boilerplate
+
+env:
+  CAGIT_CACHE_DIR=    override default /tmp/cagit-cache location
+"#;
+
 fn print_usage() {
-    eprintln!("usage:");
-    eprintln!("  cagit <repo> <type> <query> [-e] [-s] [oldest|newest|N]");
-    eprintln!("    scan pack for objects of <type> matching regex <query>");
-    eprintln!("    type:           blob | commit | tree | tag | all");
-    eprintln!("");
-    eprintln!("  cagit <repo> find <sha> [N]");
-    eprintln!("    N oldest commits whose tree contains <sha> (default N=1)");
-    eprintln!("");
-    eprintln!("  cagit <repo> dag [<sha>]");
-    eprintln!("    DAG stats; with sha: gen/ancestors/descendants for that commit");
-    eprintln!("");
-    eprintln!("  cagit <repo> integrated <commit_sha> [<head_sha>]");
-    eprintln!("    merge commit that first integrated <commit_sha> into HEAD");
-    eprintln!("");
-    eprintln!("  cagit comp <base> <target1> [<target2> ...]");
-    eprintln!("    N-way ancestor diff + LCA across repos (paths or URLs)");
-    eprintln!("");
-    eprintln!("  cagit comp-has <sha> <repo1> [<repo2> ...]");
-    eprintln!("    yes/no presence of <sha> in each repo (with HEAD-reachability)");
-    eprintln!("");
-    eprintln!("flags:");
-    eprintln!("  -e, --exact         exact word match (regex wrap \\b(?:...)\\b)");
-    eprintln!("  -s, --summary       include commit author + first-line summary");
-    eprintln!("  CAGIT_CACHE_DIR=    override /tmp/cagit-cache");
+    eprint!("{USAGE}");
 }
 
 fn main() {
@@ -61,7 +80,7 @@ fn main() {
         }
     }
 
-    // `cagit comp <base> <target1> [<target2> ...]` — N-way ancestor diff + LCA.
+    // `cagit comp <base> <target1> [<target2> ...]`  N-way ancestor diff + LCA.
     if args.len() >= 2 && args[1].as_str() == "comp" {
         if args.len() < 4 {
             eprintln!("usage: cagit comp <base> <target1> [<target2> ...]");
@@ -72,7 +91,19 @@ fn main() {
         return;
     }
 
-    // `cagit comp-has <sha> <repo1> [<repo2> ...]` — for each repo, does this
+    // `cagit churn <base> <fork> [N]`  top-N most-modified paths across
+    // commits in fork-not-base (first-parent diff per commit).
+    if args.len() >= 2 && args[1].as_str() == "churn" {
+        if args.len() < 4 {
+            eprintln!("usage: cagit churn <base> <fork> [N]");
+            std::process::exit(1);
+        }
+        let n: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(20);
+        run_churn(args[2].as_str(), args[3].as_str(), n);
+        return;
+    }
+
+    // `cagit comp-has <sha> <repo1> [<repo2> ...]`  for each repo, does this
     // commit sha exist anywhere in its DAG? Yes/no per repo.
     if args.len() >= 2 && args[1].as_str() == "comp-has" {
         if args.len() < 4 {
@@ -117,6 +148,18 @@ fn main() {
         }
         let sha_arg = args.get(3).map(|s| s.as_str());
         run_dag(&git_dir, args[1].as_str(), sha_arg);
+        return;
+    }
+
+    if args[2].as_str() == "duper" {
+        if is_remote {
+            eprintln!("duper: local only for now");
+            std::process::exit(1);
+        }
+        let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15);
+        let min_lines: usize = args.get(4).and_then(|s| s.parse().ok())
+            .unwrap_or(cagit::duper::MIN_LINES).max(2);
+        run_duper(args[1].as_str(), n, min_lines);
         return;
     }
 
@@ -257,6 +300,8 @@ fn main() {
     }
 }
 
+// Regex-bound summary helpers (scan-only). Generic regex-free helpers live in
+// `cagit::util`; these dispatch through there for commit/tag.
 fn make_summary(kind: u8, data: &[u8], re: &Regex) -> String {
     match kind {
         1 => commit_summary(data),
@@ -265,30 +310,6 @@ fn make_summary(kind: u8, data: &[u8], re: &Regex) -> String {
         4 => tag_summary(data),
         _ => String::new(),
     }
-}
-
-fn commit_timestamp(data: &[u8]) -> i64 {
-    let text = String::from_utf8_lossy(data);
-    text.lines()
-        .find(|l| l.starts_with("author "))
-        .and_then(|l| l.split_ascii_whitespace().nth_back(1))
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
-}
-
-fn commit_summary(data: &[u8]) -> String {
-    let text = String::from_utf8_lossy(data);
-    let author = text.lines()
-        .find(|l| l.starts_with("author "))
-        .and_then(|l| l.strip_prefix("author "))
-        .and_then(|l| l.split('<').next())
-        .map(|s| s.trim())
-        .unwrap_or("?");
-    let msg = text.find("\n\n")
-        .map(|i| text[i + 2..].trim_start())
-        .unwrap_or("");
-    let first_line = msg.lines().next().unwrap_or("").trim();
-    format!("{author}: {first_line}")
 }
 
 fn blob_summary(data: &[u8], re: &Regex) -> String {
@@ -314,31 +335,6 @@ fn tree_summary(data: &[u8], re: &Regex) -> String {
         pos += sp + nul + 1 + 20;
     }
     String::new()
-}
-
-fn tag_summary(data: &[u8]) -> String {
-    String::from_utf8_lossy(data).lines().next().unwrap_or("").to_string()
-}
-
-fn kind_name(kind: u8) -> &'static str {
-    match kind { 1 => "commit", 2 => "tree", 3 => "blob", 4 => "tag", _ => "?" }
-}
-
-fn hex40(sha: &[u8; 20]) -> String {
-    let mut s = String::with_capacity(40);
-    for b in sha { write!(s, "{b:02x}").unwrap(); }
-    s
-}
-
-// Compute the git object SHA from kind + decompressed content.
-// git SHA = sha1("<type> <size>\0<content>")
-fn object_sha(kind: u8, data: &[u8]) -> String {
-    let header = format!("{} {}\0", kind_name(kind), data.len());
-    let mut h = sha1_smol::Sha1::new();
-    h.update(header.as_bytes());
-    h.update(data);
-    let bytes = h.digest().bytes();
-    hex40(&bytes)
 }
 
 // N oldest commits whose root tree (recursively) contains target. Distinct
@@ -413,199 +409,120 @@ fn run_find(
     }
 }
 
-// Derive a stable cache dir for a given repo arg (URL or local path).
-// Layout: <base>/<repo>/. Override base via CAGIT_CACHE_DIR.
-fn cache_dir_for(repo_arg: &str) -> PathBuf {
-    let base = std::env::var("CAGIT_CACHE_DIR").unwrap_or_else(|_| "/tmp/cagit-cache".to_string());
-    let repo = if repo_arg.starts_with("http://") || repo_arg.starts_with("https://") {
-        let after_scheme = repo_arg.split("://").nth(1).unwrap_or("");
-        let parts: Vec<&str> = after_scheme.trim_end_matches('/').split('/').collect();
-        parts.last().map(|s| s.trim_end_matches(".git").to_string()).unwrap_or_else(|| "repo".to_string())
-    } else {
-        let p = PathBuf::from(repo_arg);
-        let canon = p.canonicalize().unwrap_or(p);
-        let stripped = if canon.file_name().and_then(|s| s.to_str()) == Some(".git") {
-            canon.parent().unwrap_or(canon.as_path()).to_path_buf()
-        } else {
-            canon
-        };
-        stripped.file_name().and_then(|s| s.to_str()).unwrap_or("repo").to_string()
+// Wraps OpenedRepo::pack_slices for the existing run_* call sites.
+fn pack_slices(repo: &OpenedRepo) -> Vec<&[u8]> { repo.pack_slices() }
+
+// cagit <repo> duper [N] [MIN_LINES]: top-N duplicate code blocks of at least
+// MIN_LINES (default 3) across HEAD's tree.
+fn run_duper(repo_arg: &str, top_n: usize, min_lines: usize) {
+    let t0 = std::time::Instant::now();
+    let repo = match open_repo(repo_arg) {
+        Ok(r) => r, Err(e) => { eprintln!("{e}"); std::process::exit(1); }
     };
-    PathBuf::from(base).join(repo)
-}
+    let t_setup = t0.elapsed();
 
-// Pack's trailing 20-byte sha = stable content fingerprint.
-fn pack_fingerprint(pack: &[u8]) -> String {
-    let mut s = String::with_capacity(40);
-    use std::fmt::Write as _;
-    for b in &pack[pack.len() - 20..] {
-        write!(s, "{b:02x}").unwrap();
+    let Some(head_idx) = repo.dag.index_by_sha(&repo.head_sha) else {
+        eprintln!("HEAD not in DAG"); std::process::exit(1);
+    };
+    let head_tree = repo.dag.commits[head_idx].root_tree;
+    let packs_slices = pack_slices(&repo);
+
+    let t1 = std::time::Instant::now();
+    let out = match cagit::duper::run(&packs_slices, &repo.sha_idxs, &repo.loose, &head_tree, min_lines) {
+        Ok(o) => o, Err(e) => { eprintln!("duper: {e}"); std::process::exit(1); }
+    };
+    let t_duper = t1.elapsed();
+
+    eprintln!("setup:   {:?}", t_setup);
+    eprintln!("scan:    {:?}", t_duper);
+    eprintln!("files scanned: {} ({} skipped binary)",
+              out.stats.files_scanned, out.stats.files_skipped_binary);
+    eprintln!("windows hashed: {} ({} unique)",
+              out.stats.windows_hashed, out.stats.unique_windows);
+    eprintln!("duplicate groups: {}", out.groups.len());
+    eprintln!();
+
+    for (rank, g) in out.groups.iter().take(top_n).enumerate() {
+        let (fi0, sl0) = g.occurrences[0];
+        let file0 = &out.files[fi0 as usize];
+        // Inflate first occurrence's blob to display the duplicated block.
+        let snippet = cagit::find::resolve_sha_multi(&packs_slices, &repo.sha_idxs, &repo.loose, &file0.blob_sha)
+            .map(|(_, body)| {
+                let lines: Vec<&[u8]> = body.split(|&b| b == b'\n').collect();
+                let start = (sl0 as usize).saturating_sub(1);
+                let end = (start + g.line_count as usize).min(lines.len());
+                lines[start..end].iter()
+                    .map(|l| String::from_utf8_lossy(l).into_owned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        println!("#{}  {} lines, {} occurrences, {} wasted",
+                 rank + 1, g.line_count, g.occurrences.len(), g.wasted_lines());
+        for line in &snippet {
+            println!("    | {line}");
+        }
+        for (fi, sl) in &g.occurrences {
+            let path = String::from_utf8_lossy(&out.files[*fi as usize].path);
+            println!("    @ {path}:{sl}");
+        }
+        println!();
     }
-    s
 }
 
-// Cache key for a multi-pack repo: concatenate sorted pack fingerprints (each
-// shortened to 16 hex chars to keep filenames reasonable).
-fn multi_pack_fingerprint(packs: &[&[u8]]) -> String {
-    let mut parts: Vec<String> = packs.iter().map(|p| pack_fingerprint(p)[..16].to_string()).collect();
-    parts.sort();
-    parts.join("-")
-}
+// cagit churn <base> <fork> [N]: top-N most-modified paths across all commits
+// in fork-not-base, diffed against each commit's first parent.
+fn run_churn(base_arg: &str, fork_arg: &str, top_n: usize) {
+    let t0 = std::time::Instant::now();
+    let base = match open_repo(base_arg) {
+        Ok(r) => r, Err(e) => { eprintln!("base: {e}"); std::process::exit(1); }
+    };
+    let fork = match open_repo(fork_arg) {
+        Ok(r) => r, Err(e) => { eprintln!("fork: {e}"); std::process::exit(1); }
+    };
+    eprintln!("repos opened: {:?}", t0.elapsed());
 
-// Load DAG from cache if present and matching the packs' combined fingerprint;
-// else build fresh and persist for next time.
-fn load_or_build_dag(
-    packs: &[&[u8]],
-    sha_idxs: &[cagit::find::ShaIndex],
-    repo_arg: &str,
-    git_dir: Option<&Path>,
-) -> io::Result<(cagit::dag::CommitDag, bool)> {
-    let dir = cache_dir_for(repo_arg);
-    let cache_path = dir.join(format!("{}.dag", multi_pack_fingerprint(packs)));
-    if cache_path.exists() {
-        if let Ok(dag) = cagit::dag::CommitDag::load(&cache_path) {
-            return Ok((dag, true));
+    let Some(fork_head_idx) = fork.dag.index_by_sha(&fork.head_sha) else {
+        eprintln!("fork HEAD not in DAG"); std::process::exit(1);
+    };
+    let fork_anc = fork.dag.ancestors(fork_head_idx);
+
+    // Set of base's HEAD-ancestor shas  FFI-backed for membership probes.
+    let mut base_set = cagit::find::ShaSet::with_capacity(8192);
+    if let Some(bhi) = base.dag.index_by_sha(&base.head_sha) {
+        for i in base.dag.ancestors(bhi) {
+            base_set.insert(&base.dag.commits[i].commit_sha);
         }
     }
-    let pairs: Vec<(&[u8], &cagit::find::ShaIndex)> = packs.iter().copied()
-        .zip(sha_idxs.iter())
-        .collect();
-    let dag = cagit::dag::CommitDag::build(&pairs, git_dir)?;
-    let _ = dag.save(&cache_path);
-    Ok((dag, false))
-}
 
-// Read HEAD's sha (hex) by following .git/HEAD (and packed-refs if needed).
-fn resolve_head(git_dir: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let trimmed = raw.trim();
-    if let Some(refpath) = trimmed.strip_prefix("ref: ") {
-        // Loose ref.
-        if let Ok(s) = std::fs::read_to_string(git_dir.join(refpath)) {
-            let s = s.trim();
-            if s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit()) {
-                return Some(s.to_string());
-            }
-        }
-        // packed-refs fallback.
-        if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
-            for line in packed.lines() {
-                if line.starts_with('#') || line.starts_with('^') { continue; }
-                let mut parts = line.split_ascii_whitespace();
-                let sha = parts.next()?;
-                let r = parts.next()?;
-                if r == refpath && sha.len() == 40 {
-                    return Some(sha.to_string());
-                }
-            }
-        }
-        None
-    } else if trimmed.len() == 40 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(trimmed.to_string())
-    } else {
-        None
+    let packs_slices = pack_slices(&fork);
+
+    let t1 = std::time::Instant::now();
+    let mut counts = cagit::churn::PathCounter::with_capacity(4096);
+    let mut considered = 0usize;
+    let mut prefix: Vec<u8> = Vec::new();
+    for &ci in &fork_anc {
+        let sha = fork.dag.commits[ci].commit_sha;
+        if base_set.contains(&sha) { continue; }
+        considered += 1;
+        let Some(parent_idx) = fork.dag.first_parent(ci) else { continue };
+        let child_tree = fork.dag.commits[ci].root_tree;
+        let parent_tree = fork.dag.commits[parent_idx].root_tree;
+        if child_tree == parent_tree { continue; }
+        prefix.clear();
+        let _ = cagit::churn::diff_trees(&packs_slices, &fork.sha_idxs, &fork.loose,
+            &child_tree, &parent_tree, &mut prefix, &mut counts);
     }
-}
+    eprintln!("diffed {} commits in {:?}", considered, t1.elapsed());
 
-enum PackSource {
-    Mapped(Mmap),
-    Heap(Vec<u8>),
-}
-impl PackSource {
-    fn as_slice(&self) -> &[u8] {
-        match self {
-            Self::Mapped(m) => m.as_ref(),
-            Self::Heap(v)   => v.as_slice(),
-        }
+    let ranked = counts.into_sorted_desc();
+
+    eprintln!();
+    println!("top {} paths by change count in fork-not-base ({} commits):",
+             top_n.min(ranked.len()), considered);
+    for (path, n) in ranked.iter().take(top_n) {
+        println!("  {n:>5}  {}", String::from_utf8_lossy(path));
     }
-}
-
-struct OpenedRepo {
-    packs: Vec<PackSource>,
-    dag: cagit::dag::CommitDag,
-    head_sha: [u8; 20],
-    dag_cached: bool,
-}
-
-fn open_repo(repo_arg: &str) -> io::Result<OpenedRepo> {
-    if repo_arg.starts_with("http://") || repo_arg.starts_with("https://") {
-        open_remote_repo(repo_arg)
-    } else {
-        open_local_repo(repo_arg)
-    }
-}
-
-fn open_local_repo(repo_arg: &str) -> io::Result<OpenedRepo> {
-    let p = PathBuf::from(repo_arg);
-    let git_dir = if p.join(".git").exists() { p.join(".git") } else { p };
-
-    let pack_dir = git_dir.join("objects/pack");
-    let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
-    if let Ok(rd) = pack_dir.read_dir() {
-        for e in rd.filter_map(|e| e.ok()) {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("pack") {
-                let ip = p.with_extension("idx");
-                if ip.exists() { pairs.push((p, ip)); }
-            }
-        }
-    }
-    if pairs.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound,
-            format!("no packs in {}", pack_dir.display())));
-    }
-    pairs.sort();
-
-    let mut mmaps_pack: Vec<Mmap> = Vec::with_capacity(pairs.len());
-    let mut mmaps_idx:  Vec<Mmap> = Vec::with_capacity(pairs.len());
-    for (pp, ip) in &pairs {
-        mmaps_pack.push(unsafe { Mmap::map(&std::fs::File::open(pp)?) }?);
-        mmaps_idx.push (unsafe { Mmap::map(&std::fs::File::open(ip)?) }?);
-    }
-    let sha_idxs: Vec<cagit::find::ShaIndex> = mmaps_idx.iter()
-        .map(|i| cagit::find::ShaIndex::from_idx(i))
-        .collect();
-
-    let pack_slices: Vec<&[u8]> = mmaps_pack.iter().map(|m| m.as_ref()).collect();
-    let (dag, dag_cached) = load_or_build_dag(&pack_slices, &sha_idxs, repo_arg, Some(&git_dir))?;
-
-    let head_sha = resolve_head(&git_dir)
-        .and_then(|hex| cagit::find::hex_to_sha(&hex))
-        .unwrap_or([0u8; 20]);
-
-    let packs = mmaps_pack.into_iter().map(PackSource::Mapped).collect();
-    Ok(OpenedRepo { packs, dag, head_sha, dag_cached })
-}
-
-// Remote: one pack fetched over HTTP. kind_mask=0b0001 → just commits (filter=blob:none).
-fn open_remote_repo(url: &str) -> io::Result<OpenedRepo> {
-    let (head_sha, pack_bytes) = cagit::remote::fetch_pack_with_head(url, 0b0001)?;
-
-    // Build ShaIndex by walking + hashing every object in the wire pack.
-    let mut pairs: Vec<([u8; 20], u64)> = Vec::new();
-    cagit::pack_scan::scan_objects_no_idx(&pack_bytes, 0, |kind, data, offset| {
-        let header = format!("{} {}\0", kind_name(kind), data.len());
-        let mut h = sha1_smol::Sha1::new();
-        h.update(header.as_bytes());
-        h.update(data);
-        pairs.push((h.digest().bytes(), offset));
-        true
-    })?;
-    let sha_idx = cagit::find::ShaIndex::from_pairs(&pairs);
-
-    let pack_slices: Vec<&[u8]> = vec![&pack_bytes];
-    let (dag, dag_cached) = load_or_build_dag(&pack_slices, &[sha_idx], url, None)?;
-
-    Ok(OpenedRepo {
-        packs: vec![PackSource::Heap(pack_bytes)],
-        dag,
-        head_sha,
-        dag_cached,
-    })
-}
-
-fn pack_slices(repo: &OpenedRepo) -> Vec<&[u8]> {
-    repo.packs.iter().map(|p| p.as_slice()).collect()
 }
 
 // cagit comp-has <sha> <repo1> [<repo2> ...]: for each repo, report whether

@@ -23,6 +23,8 @@ impl OffsetMap {
     pub fn reserve(&mut self, n: u64) {
         unsafe { ffi::dhasht_om_reserve(&mut self.inner, n, 0); }
     }
+    pub fn len(&self) -> usize { self.inner._num_filled as usize }
+    pub fn contains(&self, k: u64) -> bool { self.get(k).is_some() }
 }
 
 impl Drop for OffsetMap {

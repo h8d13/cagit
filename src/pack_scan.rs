@@ -10,7 +10,6 @@
 //        git/Documentation/technical/bitmap-format.txt
 //        git/Documentation/technical/pack-format.txt (MIDX section)
 
-use std::collections::HashSet;
 use std::io::{self, Read as _};
 
 use flate2::read::ZlibDecoder;
@@ -79,7 +78,7 @@ pub fn scan_objects(pack: &[u8], idx: &[u8], kind_mask: u8, mut on_object: impl 
 
     'scan: for i in 0..n {
         let obj_off  = offsets[i];
-        let is_base  = base_set.contains(&obj_off);
+        let is_base  = base_set.contains(obj_off);
         let mut pos  = obj_off as usize;
         let (obj_type, size) = read_obj_header(pack, &mut pos);
 
@@ -127,10 +126,13 @@ pub fn scan_objects(pack: &[u8], idx: &[u8], kind_mask: u8, mut on_object: impl 
     Ok(())
 }
 
-// Collect offsets that must be cached as OFS_DELTA bases.
+// Collect offsets that must be cached as OFS_DELTA bases. Uses our FFI map
+// directly as a set (value is a sentinel; we only probe presence).
 // If the base is itself type 6 (kind unknown without chain walk), mark it conservatively.
-fn collect_bases(pack: &[u8], offsets: &[u64], mask: u8) -> HashSet<u64> {
-    let mut bases = HashSet::with_capacity(offsets.len() / 4);
+fn collect_bases(pack: &[u8], offsets: &[u64], mask: u8) -> OffsetMap {
+    let cap = (offsets.len() / 4).max(16);
+    let mut bases = OffsetMap::new(cap.next_power_of_two());
+    bases.reserve(cap as u64);
     for &off in offsets {
         let mut pos = off as usize;
         let (obj_type, _) = read_obj_header(pack, &mut pos);
@@ -142,7 +144,7 @@ fn collect_bases(pack: &[u8], offsets: &[u64], mask: u8) -> HashSet<u64> {
                 let include = base_type == 6
                     || (base_type >= 1 && base_type <= 4 && mask & (1 << (base_type - 1)) != 0);
                 if include {
-                    bases.insert(base_off);
+                    bases.set(base_off, 1);
                 }
             }
         }
