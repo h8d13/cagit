@@ -33,7 +33,5 @@ The difference with all the other git "search the index" tools:
 
 Accepts both local file paths and remote URLs. No building local indexes. 
 Not re-writing git or wrapping it. In memory/compute only no traces on disk.
-
+(Only ever build cache DAG on /tmp for certain operations)
 One sequential pass over the raw pack. Each object decompressed exactly once.
-
----
