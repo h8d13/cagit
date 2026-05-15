@@ -1,3 +1,4 @@
+pub mod dag;
 pub mod ffi;
 pub mod find;
 pub mod offset_map;

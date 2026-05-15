@@ -32,6 +32,10 @@ fn agent() -> ureq::Agent {
 }
 
 pub fn fetch_pack(url: &str, kind_mask: u8) -> io::Result<Vec<u8>> {
+    fetch_pack_with_head(url, kind_mask).map(|(_, p)| p)
+}
+
+pub fn fetch_pack_with_head(url: &str, kind_mask: u8) -> io::Result<([u8; 20], Vec<u8>)> {
     let base = url.trim_end_matches('/');
     let agent = agent();
 
@@ -45,7 +49,7 @@ pub fn fetch_pack(url: &str, kind_mask: u8) -> io::Result<Vec<u8>> {
 
     let pack = request_pack(&agent, base, &head_sha, use_filter)?;
     eprintln!("pack  {} bytes", pack.len());
-    Ok(pack)
+    Ok((head_sha, pack))
 }
 
 // GET info/refs: returns (HEAD sha, capabilities string).
