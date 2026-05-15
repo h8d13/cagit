@@ -1,0 +1,39 @@
+promise was simple
+
+take a repo with hunderds of thousands of commits (used git/git as example):
+300MiB delta-compressed results in GBs of full history.
+
+we want to be able to parse this as effeciently as possible.
+this is where hash maps/sets become interesting.
+
+example usage:
+
+cargo build --release
+
+# local
+./target/release/ghash ~/h8d13/git commit -se "cat" oldest 1
+bf0c6e839c692142784caf07b523cd69442e57a5  commit  Linus Torvalds: Make "cat-file" output the file contents to stdout.
+
+# remote no clone needed
+./target/release/ghash https://github.com/git/git.git commit -se "cat" oldest 1
+HEAD 59ff4886a579f4bc91e976fe18590b9ae02c7a08
+filter  blob:none
+pack  108MiB
+bf0c6e839c692142784caf07b523cd69442e57a5  commit  Linus Torvalds: Make "cat-file" output the file contents to stdout.
+
+-s = summary
+-e = exact word match, otherwise substring/regex
+
+when not searching blobs, filter=blob:none is negotiated automatically (~300MiB → ~108MiB).
+output is pipe-friendly (full sha40 + kind). use -s to add a one-line summary.
+
+---
+
+The difference with all the other git "search the index" tools:
+
+Accepts both local file paths and remote URLs. No building local indexes. 
+Not re-writing git or wrapping it. In memory/compute only no traces on disk.
+
+One sequential pass over the raw pack. Each object decompressed exactly once.
+
+---

@@ -1,0 +1,15 @@
+[package]
+name = "ghash"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+flate2 = { version = "1", features = ["zlib-rs"] }
+memchr = "2"
+memmap2 = "0.9"
+regex = "1"
+sha1_smol = "1"
+ureq = "2"
+
+[build-dependencies]
+cc = "1"
