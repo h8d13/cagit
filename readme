@@ -1,4 +1,4 @@
-# git-hasht
+# cagit
 
 take a repo with hundreds of thousands of commits (used git/git as example):
 300MiB delta-compressed results in GBs of full history.
@@ -11,11 +11,11 @@ example usage:
 cargo build --release
 
 # local
-./target/release/ghash ~/h8d13/git commit -se "cat" oldest 1
+./target/release/cagit ~/h8d13/git commit -se "cat" oldest 1
 bf0c6e839c692142784caf07b523cd69442e57a5  commit  Linus Torvalds: Make "cat-file" output the file contents to stdout.
 
 # remote no clone needed
-./target/release/ghash https://github.com/git/git.git commit -se "cat" oldest 1
+./target/release/cagit https://github.com/git/git.git commit -se "cat" oldest 1
 HEAD 59ff4886a579f4bc91e976fe18590b9ae02c7a08
 filter  blob:none
 pack  108MiB

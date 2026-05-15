@@ -1,29 +1,50 @@
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use ghash::pack_scan::{idx_sha_map, scan_objects, scan_objects_no_idx};
-use ghash::remote::fetch_pack;
+use cagit::pack_scan::{idx_sha_map, scan_objects, scan_objects_no_idx};
+use cagit::remote::fetch_pack;
 use memmap2::Mmap;
 use regex::bytes::Regex;
 
+fn print_usage() {
+    eprintln!("usage: cagit <repo> <type> <query> [-e|--exact] [-s|--summary] [oldest|newest|N]");
+    eprintln!("  type:               blob | commit | tree | tag | all");
+    eprintln!("  -e, --exact:        exact word match (wraps query in \\b(?:...)\\b)");
+    eprintln!("  -s, --summary:      show one-line summary (default: sha + kind only)");
+    eprintln!("  oldest|newest:      sort commits by author date, show 10");
+    eprintln!("  oldest N:           sort commits by author date, show N");
+    eprintln!("  N:                  show first N results  (default: 10)");
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().collect();
-    let is_flag = |a: &str| a.starts_with('-') && !a.starts_with("--") && a[1..].chars().all(|c| "es".contains(c));
-    let exact   = raw.iter().any(|a| is_flag(a) && a.contains('e'));
-    let summary = raw.iter().any(|a| is_flag(a) && a.contains('s'));
-    let args: Vec<&String> = raw.iter().enumerate()
-        .filter(|(i, a)| *i == 0 || !is_flag(a))
-        .map(|(_, a)| a)
-        .collect();
+
+    let mut exact   = false;
+    let mut summary = false;
+    let mut args: Vec<&String> = Vec::with_capacity(raw.len());
+    args.push(&raw[0]);
+    for a in raw.iter().skip(1) {
+        match a.as_str() {
+            "--help" | "-h" => { print_usage(); return; }
+            "--exact"       => exact = true,
+            "--summary"     => summary = true,
+            s if s.starts_with("--") => {
+                eprintln!("unknown option '{s}' (try --help)");
+                std::process::exit(1);
+            }
+            // combined short flags: -e, -s, -es, -se
+            s if s.len() > 1 && s.starts_with('-')
+                && s[1..].chars().all(|c| "es".contains(c)) =>
+            {
+                exact   |= s.contains('e');
+                summary |= s.contains('s');
+            }
+            _ => args.push(a),
+        }
+    }
 
     if args.len() < 4 {
-        eprintln!("usage: ghash <repo> <type> <query> [-e] [-s] [oldest|newest|N]");
-        eprintln!("  type:          blob | commit | tree | tag | all");
-        eprintln!("  -e:            exact word match (wraps query in \\b(?:...)\\b)");
-        eprintln!("  -s:            show one-line summary (default: sha + kind only)");
-        eprintln!("  oldest|newest: sort commits by author date, show 10");
-        eprintln!("  oldest N:      sort commits by author date, show N");
-        eprintln!("  N:             show first N results  (default: 10)");
+        print_usage();
         std::process::exit(1);
     }
 

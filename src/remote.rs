@@ -14,16 +14,28 @@
 //            git/Documentation/technical/http-protocol.txt
 
 use std::io::{self, Read};
+use std::time::Duration;
 
 // kind_mask bit 2 = blob. If blob bit is unset and mask is non-zero, no blobs needed.
 fn needs_blobs(kind_mask: u8) -> bool {
     kind_mask == 0 || (kind_mask & 0b0100 != 0)
 }
 
+// Per-socket-operation timeouts (not total): bound idle / hung-connection time,
+// don't penalize legitimately-slow pack downloads.
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(60))
+        .build()
+}
+
 pub fn fetch_pack(url: &str, kind_mask: u8) -> io::Result<Vec<u8>> {
     let base = url.trim_end_matches('/');
+    let agent = agent();
 
-    let (head_sha, caps) = discover_head(base)?;
+    let (head_sha, caps) = discover_head(&agent, base)?;
     eprintln!("HEAD {}", hex40(&head_sha));
 
     let use_filter = !needs_blobs(kind_mask) && caps.contains("filter");
@@ -31,15 +43,15 @@ pub fn fetch_pack(url: &str, kind_mask: u8) -> io::Result<Vec<u8>> {
         eprintln!("filter  blob:none");
     }
 
-    let pack = request_pack(base, &head_sha, use_filter)?;
+    let pack = request_pack(&agent, base, &head_sha, use_filter)?;
     eprintln!("pack  {} bytes", pack.len());
     Ok(pack)
 }
 
 // GET info/refs: returns (HEAD sha, capabilities string).
-fn discover_head(base: &str) -> io::Result<([u8; 20], String)> {
+fn discover_head(agent: &ureq::Agent, base: &str) -> io::Result<([u8; 20], String)> {
     let url = format!("{base}/info/refs?service=git-upload-pack");
-    let resp = ureq::get(&url)
+    let resp = agent.get(&url)
         .call()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
     let mut body = Vec::new();
@@ -49,7 +61,7 @@ fn discover_head(base: &str) -> io::Result<([u8; 20], String)> {
 }
 
 // POST git-upload-pack, demux sideband, return raw pack bytes.
-fn request_pack(base: &str, sha: &[u8; 20], filter_blobs: bool) -> io::Result<Vec<u8>> {
+fn request_pack(agent: &ureq::Agent, base: &str, sha: &[u8; 20], filter_blobs: bool) -> io::Result<Vec<u8>> {
     let caps = if filter_blobs {
         "side-band-64k ofs-delta no-progress filter"
     } else {
@@ -66,7 +78,7 @@ fn request_pack(base: &str, sha: &[u8; 20], filter_blobs: bool) -> io::Result<Ve
     body.extend(b"0009done\n");
 
     let url = format!("{base}/git-upload-pack");
-    let resp = ureq::post(&url)
+    let resp = agent.post(&url)
         .set("Content-Type", "application/x-git-upload-pack-request")
         .set("Accept",       "application/x-git-upload-pack-result")
         .send_bytes(&body)

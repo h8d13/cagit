@@ -14,7 +14,7 @@ fn remote_url() -> String {
 }
 
 fn ghash(args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_ghash"))
+    Command::new(env!("CARGO_BIN_EXE_cagit"))
         .args(args)
         .output()
         .unwrap()
