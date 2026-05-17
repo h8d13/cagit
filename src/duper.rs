@@ -8,6 +8,7 @@ use std::io;
 
 use crate::find::{resolve_sha_multi, LooseStore, ShaIndex};
 use crate::offset_map::OffsetMap;
+use regex::bytes::Regex;
 
 const NO_NEXT: u32 = u32::MAX;
 pub const MIN_LINES: usize = 3;
@@ -89,6 +90,10 @@ fn trim(s: &[u8]) -> &[u8] {
     &s[start..end]
 }
 
+fn path_excluded(path: &[u8], excludes: &[Regex]) -> bool {
+    excludes.iter().any(|re| re.is_match(path))
+}
+
 // Walk tree recursively (sha-based, multi-pack + loose), collecting code-like blobs.
 fn walk_tree(
     packs: &[&[u8]],
@@ -96,6 +101,7 @@ fn walk_tree(
     loose: &LooseStore,
     tree_sha: &[u8; 20],
     prefix: &[u8],
+    excludes: &[Regex],
     out: &mut Vec<FileEntry>,
 ) -> io::Result<()> {
     let Some((_kind, data)) = resolve_sha_multi(packs, sha_idxs, loose, tree_sha) else {
@@ -118,7 +124,9 @@ fn walk_tree(
             let mut new_prefix = prefix.to_vec();
             if !prefix.is_empty() { new_prefix.push(b'/'); }
             new_prefix.extend_from_slice(name);
-            walk_tree(packs, sha_idxs, loose, &sha, &new_prefix, out)?;
+            if !path_excluded(&new_prefix, excludes) {
+                walk_tree(packs, sha_idxs, loose, &sha, &new_prefix, excludes, out)?;
+            }
         } else {
             // blob filtering
             if SKIP_STEMS.contains(&stem(name)) {
@@ -136,7 +144,9 @@ fn walk_tree(
                 let mut full = prefix.to_vec();
                 if !prefix.is_empty() { full.push(b'/'); }
                 full.extend_from_slice(name);
-                out.push(FileEntry { path: full, blob_sha: sha });
+                if !path_excluded(&full, excludes) {
+                    out.push(FileEntry { path: full, blob_sha: sha });
+                }
             }
         }
         pos = sha_start + 20;
@@ -247,9 +257,10 @@ pub fn run(
     loose: &LooseStore,
     head_tree_sha: &[u8; 20],
     min_lines: usize,
+    excludes: &[Regex],
 ) -> io::Result<DuperOutput> {
     let mut files: Vec<FileEntry> = Vec::new();
-    walk_tree(packs, sha_idxs, loose, head_tree_sha, b"", &mut files)?;
+    walk_tree(packs, sha_idxs, loose, head_tree_sha, b"", excludes, &mut files)?;
 
     let mut slab: Vec<SlabEntry> = Vec::new();
     let mut map = OffsetMap::new(1 << 16);

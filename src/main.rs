@@ -41,9 +41,10 @@ const USAGE: &str = r#"usage:
 
   -- code-content analysis --
 
-  cagit <repo> duper [N=15] [MIN_LINES=3]
+  cagit <repo> duper [N=15] [MIN_LINES=3] [--exclude=<pattern> ...]
     top-N duplicate code blocks in repo's HEAD tree
     higher MIN_LINES (5-8) filters out framework boilerplate
+    --exclude=<pattern>: skip paths matching regex (repeatable)
 
 env:
   CAGIT_CACHE_DIR=    override default /tmp/cagit-cache location
@@ -58,6 +59,7 @@ fn main() {
 
     let mut exact   = false;
     let mut summary = false;
+    let mut exclude_pats: Vec<String> = Vec::new();
     let mut args: Vec<&String> = Vec::with_capacity(raw.len());
     args.push(&raw[0]);
     for a in raw.iter().skip(1) {
@@ -65,6 +67,9 @@ fn main() {
             "--help" | "-h" => { print_usage(); return; }
             "--exact"       => exact = true,
             "--summary"     => summary = true,
+            s if s.starts_with("--exclude=") => {
+                exclude_pats.push(s["--exclude=".len()..].to_string());
+            }
             s if s.starts_with("--") => {
                 eprintln!("unknown option '{s}' (try --help)");
                 std::process::exit(1);
@@ -79,6 +84,12 @@ fn main() {
             _ => args.push(a),
         }
     }
+    let excludes: Vec<regex::bytes::Regex> = exclude_pats.iter().map(|p| {
+        regex::bytes::Regex::new(p).unwrap_or_else(|e| {
+            eprintln!("invalid --exclude pattern '{p}': {e}");
+            std::process::exit(1);
+        })
+    }).collect();
 
     // `cagit comp <base> <target1> [<target2> ...]`  N-way ancestor diff + LCA.
     if args.len() >= 2 && args[1].as_str() == "comp" {
@@ -151,7 +162,7 @@ fn main() {
         let n: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(15);
         let min_lines: usize = args.get(4).and_then(|s| s.parse().ok())
             .unwrap_or(cagit::duper::MIN_LINES).max(2);
-        run_duper(args[1].as_str(), n, min_lines);
+        run_duper(args[1].as_str(), n, min_lines, &excludes);
         return;
     }
 
@@ -400,7 +411,7 @@ fn pack_slices(repo: &OpenedRepo) -> Vec<&[u8]> { repo.pack_slices() }
 
 // cagit <repo> duper [N] [MIN_LINES]: top-N duplicate code blocks of at least
 // MIN_LINES (default 3) across HEAD's tree.
-fn run_duper(repo_arg: &str, top_n: usize, min_lines: usize) {
+fn run_duper(repo_arg: &str, top_n: usize, min_lines: usize, excludes: &[regex::bytes::Regex]) {
     let t0 = std::time::Instant::now();
     // duper needs blob content; over the wire that means a full pack fetch
     // (no filter=blob:none).
@@ -416,7 +427,7 @@ fn run_duper(repo_arg: &str, top_n: usize, min_lines: usize) {
     let packs_slices = pack_slices(&repo);
 
     let t1 = std::time::Instant::now();
-    let out = match cagit::duper::run(&packs_slices, &repo.sha_idxs, &repo.loose, &head_tree, min_lines) {
+    let out = match cagit::duper::run(&packs_slices, &repo.sha_idxs, &repo.loose, &head_tree, min_lines, excludes) {
         Ok(o) => o, Err(e) => { eprintln!("duper: {e}"); std::process::exit(1); }
     };
     let t_duper = t1.elapsed();
