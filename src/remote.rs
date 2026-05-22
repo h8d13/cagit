@@ -64,6 +64,46 @@ fn discover_head(agent: &ureq::Agent, base: &str) -> io::Result<([u8; 20], Strin
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no SHA found in info/refs"))
 }
 
+// GET info/refs: parse every advertised ref. Returns (HEAD sha, [(refname, sha)..]).
+// Caps on first ref line are dropped. Peeled-tag lines (`refs/tags/x^{}`) retained
+// so caller can decide; use a HashMap to dedupe by sha if desired.
+pub fn discover_refs(url: &str) -> io::Result<([u8; 20], Vec<(String, [u8; 20])>)> {
+    let base = url.trim_end_matches('/');
+    let agent = agent();
+    let req = format!("{base}/info/refs?service=git-upload-pack");
+    let resp = agent.get(&req)
+        .call()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+    let mut body = Vec::new();
+    resp.into_reader().read_to_end(&mut body)?;
+    parse_all_refs(&body)
+}
+
+fn parse_all_refs(data: &[u8]) -> io::Result<([u8; 20], Vec<(String, [u8; 20])>)> {
+    let mut pos = 0;
+    let mut head_sha = [0u8; 20];
+    let mut refs: Vec<(String, [u8; 20])> = Vec::new();
+    while pos < data.len() {
+        let Some(pkt) = read_pkt_line(data, &mut pos) else { break };
+        if pkt.len() < 41 || pkt[40] != b' ' { continue; }
+        let Ok(hex) = std::str::from_utf8(&pkt[..40]) else { continue };
+        if !hex.chars().all(|c| c.is_ascii_hexdigit()) { continue; }
+        let Some(sha) = hex_to_sha(hex) else { continue };
+        let after = &pkt[41..];
+        let end = after.iter().position(|&b| b == 0).unwrap_or(after.len());
+        let name_bytes = &after[..end];
+        let name = String::from_utf8_lossy(name_bytes)
+            .trim_end_matches('\n')
+            .to_string();
+        if name == "HEAD" { head_sha = sha; continue; }
+        refs.push((name, sha));
+    }
+    if refs.is_empty() && head_sha == [0u8; 20] {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no refs advertised"));
+    }
+    Ok((head_sha, refs))
+}
+
 // POST git-upload-pack, demux sideband, return raw pack bytes.
 fn request_pack(agent: &ureq::Agent, base: &str, sha: &[u8; 20], filter_blobs: bool) -> io::Result<Vec<u8>> {
     let caps = if filter_blobs {

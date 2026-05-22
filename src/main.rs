@@ -36,6 +36,11 @@ const USAGE: &str = r#"usage:
     yes/no presence of <sha> in each repo (with HEAD-reachability)
     -s, --summary:      include commit message when found
 
+  cagit <repo> refs [<pattern>] [N=50] [-e|--exact]
+    enumerate advertised refs (remote only), filter name by regex
+    dedupes refs pointing at same sha via hash table
+    -e, --exact:        wrap pattern in \b(?:...)\b for word match
+
   cagit churn <base> <fork> [N=20]
     top-N most-modified paths across commits in fork-not-base
 
@@ -141,6 +146,13 @@ fn main() {
     } else {
         repo_path.clone()
     };
+
+    if args[2].as_str() == "refs" {
+        let pattern = args.get(3).map(|s| s.as_str()).unwrap_or("");
+        let n: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(50);
+        run_refs(args[1].as_str(), pattern, n, exact);
+        return;
+    }
 
     if args[2].as_str() == "find" {
         let limit: usize = args.get(4).and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -757,6 +769,90 @@ fn run_dag(repo_arg: &str, sha_arg: Option<&str>) {
         eprintln!("ancestors:       {} ({:?})", ancestors.len(), t_anc);
         eprintln!("descendants:     {} ({:?})", descendants.len(), t_desc);
         eprintln!("author_ts:       {}", c.author_ts);
+    }
+}
+
+// cagit <url> refs [<pattern>] [N]: discover all refs via info/refs, regex-filter
+// by ref name, dedupe by sha through the FFI emhash8 map (same chained-slab
+// shape as ShaIndex/ShaSet). No pack fetch — works on monorepos like
+// archlinux/aur where each package is a branch.
+const REFS_NO_NEXT: u32 = u32::MAX;
+
+struct RefBucket {
+    sha: [u8; 20],
+    names: Vec<String>,
+    next: u32,
+}
+
+fn refs_sha_key(sha: &[u8; 20]) -> u64 {
+    u64::from_le_bytes(sha[..8].try_into().unwrap())
+}
+
+fn run_refs(url: &str, pattern: &str, n: usize, exact: bool) {
+    use cagit::offset_map::OffsetMap;
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        eprintln!("refs subcommand requires a remote URL");
+        std::process::exit(1);
+    }
+    let pat = if exact && !pattern.is_empty() {
+        format!(r"\b(?:{})\b", pattern)
+    } else {
+        pattern.to_string()
+    };
+    let re = match Regex::new(&pat) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("invalid regex: {e}"); std::process::exit(1); }
+    };
+    let t0 = std::time::Instant::now();
+    let (head, refs) = match cagit::remote::discover_refs(url) {
+        Ok(x) => x,
+        Err(e) => { eprintln!("discover: {e}"); std::process::exit(1); }
+    };
+    eprintln!("HEAD {}", cagit::util::hex40(&head));
+    eprintln!("refs advertised: {} ({:?})", refs.len(), t0.elapsed());
+
+    // Filter first so dedupe timing is pure map work (no regex in the loop).
+    let filtered: Vec<(String, [u8; 20])> = refs.into_iter()
+        .filter(|(name, _)| pattern.is_empty() || re.is_match(name.as_bytes()))
+        .collect();
+    eprintln!("matched: {}", filtered.len());
+
+    let t1 = std::time::Instant::now();
+    let cap = filtered.len().next_power_of_two().max(16);
+    let mut map = OffsetMap::new(cap);
+    map.reserve(filtered.len() as u64);
+    let mut slab: Vec<RefBucket> = Vec::with_capacity(filtered.len());
+    for (name, sha) in filtered {
+        let k = refs_sha_key(&sha);
+        let mut cur = map.get(k);
+        let mut hit: Option<u32> = None;
+        while let Some(idx) = cur {
+            let e = &slab[idx as usize];
+            if e.sha == sha { hit = Some(idx); break; }
+            cur = if e.next == REFS_NO_NEXT { None } else { Some(e.next) };
+        }
+        match hit {
+            Some(idx) => slab[idx as usize].names.push(name),
+            None => {
+                let prev = map.get(k).unwrap_or(REFS_NO_NEXT);
+                map.set(k, slab.len() as u32);
+                slab.push(RefBucket { sha, names: vec![name], next: prev });
+            }
+        }
+    }
+    eprintln!("ffi dedupe: {:?}  ({} unique shas)", t1.elapsed(), slab.len());
+
+    // Walk the slab directly  no rehash, no Vec-of-tuples copy.
+    let mut order: Vec<u32> = (0..slab.len() as u32).collect();
+    order.sort_by(|&a, &b| {
+        let am = slab[a as usize].names.iter().min().unwrap();
+        let bm = slab[b as usize].names.iter().min().unwrap();
+        am.cmp(bm)
+    });
+    for idx in order.into_iter().take(n) {
+        let bucket = &mut slab[idx as usize];
+        bucket.names.sort();
+        println!("{}  {}", cagit::util::hex40(&bucket.sha), bucket.names.join(", "));
     }
 }
 
