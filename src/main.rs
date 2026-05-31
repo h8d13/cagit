@@ -28,6 +28,11 @@ const USAGE: &str = r#"usage:
     merge commit that first landed <commit_sha> in HEAD's history
     -s, --summary:      include the landing merge's commit message
 
+  cagit <repo> contains <commit_sha> [-a|--all] [-s|--summary]
+    earliest tag (release) whose history contains <commit_sha>
+    -a, --all:          list every containing tag, earliest first
+    -s, --summary:      include the tag commit's message
+
   cagit comp <base> <target1> [<target2> ...] [-s|--summary]
     N-way ancestor diff + LCA across repos (paths or URLs)
     -s, --summary:      include LCA commit's message
@@ -64,6 +69,7 @@ fn main() {
 
     let mut exact   = false;
     let mut summary = false;
+    let mut all     = false;
     let mut exclude_pats: Vec<String> = Vec::new();
     let mut args: Vec<&String> = Vec::with_capacity(raw.len());
     args.push(&raw[0]);
@@ -72,6 +78,7 @@ fn main() {
             "--help" | "-h" => { print_usage(); return; }
             "--exact"       => exact = true,
             "--summary"     => summary = true,
+            "--all"         => all = true,
             s if s.starts_with("--exclude=") => {
                 exclude_pats.push(s["--exclude=".len()..].to_string());
             }
@@ -79,12 +86,13 @@ fn main() {
                 eprintln!("unknown option '{s}' (try --help)");
                 std::process::exit(1);
             }
-            // combined short flags: -e, -s, -es, -se
+            // combined short flags: -e, -s, -a, -es, -sa, ...
             s if s.len() > 1 && s.starts_with('-')
-                && s[1..].chars().all(|c| "es".contains(c)) =>
+                && s[1..].chars().all(|c| "esa".contains(c)) =>
             {
                 exact   |= s.contains('e');
                 summary |= s.contains('s');
+                all     |= s.contains('a');
             }
             _ => args.push(a),
         }
@@ -192,6 +200,15 @@ fn main() {
             None => None, // remote: resolved inside run_landed from repo.head_sha
         };
         run_landed(args[1].as_str(), commit_hex, head_hex_owned.as_deref(), summary);
+        return;
+    }
+
+    if args[2].as_str() == "contains" {
+        let commit_hex = args.get(3).map(|s| s.as_str()).unwrap_or_else(|| {
+            print_usage();
+            std::process::exit(1);
+        });
+        run_contains(args[1].as_str(), &git_dir, commit_hex, summary, all);
         return;
     }
 
@@ -716,6 +733,102 @@ fn run_landed(repo_arg: &str, commit_hex: &str, head_hex_opt: Option<&str>, summ
         None => {
             eprintln!("commit not reachable to HEAD, or reached without a merge (direct first-parent)");
             std::process::exit(1);
+        }
+    }
+}
+
+// cagit <repo> contains <commit_sha>: the earliest tag (release) whose history
+// contains <commit_sha>. One descendants-BFS from the commit marks every commit
+// that contains it; each tag tip is then an O(1) membership lookup (no BFS per
+// tag). "Earliest" = the containing tag with the lowest generation number
+// (topologically first). Needs only the commit graph: remote fetch is tree:0.
+fn run_contains(repo_arg: &str, git_dir: &Path, commit_hex: &str, summary: bool, all: bool) {
+    let Some(target) = cagit::find::hex_to_sha(commit_hex) else {
+        eprintln!("invalid commit sha: {commit_hex}");
+        std::process::exit(1);
+    };
+    let is_remote = repo_arg.starts_with("https://") || repo_arg.starts_with("http://");
+
+    let t0 = std::time::Instant::now();
+    let repo = match open_repo(repo_arg) {
+        Ok(r) => r, Err(e) => { eprintln!("{e}"); std::process::exit(1); }
+    };
+    eprintln!("dag {}: {:?}", if repo.dag_cached { "loaded" } else { "built" }, t0.elapsed());
+    let dag = &repo.dag;
+
+    let Some(x_idx) = dag.index_by_sha(&target) else {
+        eprintln!("commit not in fetched history (not reachable from HEAD?): {commit_hex}");
+        std::process::exit(1);
+    };
+
+    // Tag tips -> (name, target_sha). Remote: advertised refs, peeled via `^{}`.
+    // Local: packed-refs + loose refs/tags.
+    let tags: Vec<(String, [u8; 20])> = if is_remote {
+        let (_, refs) = match cagit::remote::discover_refs(repo_arg) {
+            Ok(x) => x,
+            Err(e) => { eprintln!("discover refs: {e}"); std::process::exit(1); }
+        };
+        let mut map: std::collections::HashMap<String, [u8; 20]> = std::collections::HashMap::new();
+        for (name, sha) in refs {
+            let Some(base) = name.strip_prefix("refs/tags/") else { continue };
+            match base.strip_suffix("^{}") {
+                Some(clean) => { map.insert(clean.to_string(), sha); } // peeled commit wins
+                None        => { map.entry(base.to_string()).or_insert(sha); }
+            }
+        }
+        map.into_iter().collect()
+    } else {
+        cagit::repo::collect_tags(git_dir)
+    };
+    eprintln!("tags: {}", tags.len());
+
+    // Mark every commit that contains X (descendants of X, X included).
+    let tq = std::time::Instant::now();
+    let desc = dag.descendants(x_idx);
+    let mut contains = vec![false; dag.commits.len()];
+    for &d in &desc { contains[d] = true; }
+
+    // (generation, author_ts, name, idx) per containing tag.
+    let mut hits: Vec<(u32, i64, String, usize)> = Vec::new();
+    let mut unresolved = 0usize;
+    for (name, tsha) in &tags {
+        match dag.index_by_sha(tsha) {
+            Some(ti) if contains[ti] => {
+                hits.push((dag.generation[ti], dag.commits[ti].author_ts, name.clone(), ti));
+            }
+            Some(_) => {}
+            None => unresolved += 1,
+        }
+    }
+    eprintln!("query: {:?}  ({} tags resolved, {} unresolved)",
+              tq.elapsed(), tags.len() - unresolved, unresolved);
+
+    if hits.is_empty() {
+        eprintln!("no tag contains {commit_hex}");
+        std::process::exit(1);
+    }
+    // Earliest first: lowest generation, then oldest author_ts, then name.
+    hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+
+    let slices = pack_slices(&repo);
+    let emit = |g: u32, name: &str, idx: usize| {
+        let sha40 = hex40(&dag.commits[idx].commit_sha);
+        if summary {
+            let body = dag.commit_body(&slices, idx);
+            println!("{name}  {sha40}  (gen {g})  {}", commit_summary(&body));
+        } else {
+            println!("{name}  {sha40}  (gen {g})");
+        }
+    };
+
+    if all {
+        eprintln!("{} containing tags (earliest first):", hits.len());
+        for (g, _, name, idx) in &hits { emit(*g, name, *idx); }
+    } else {
+        let (g, _, name, idx) = &hits[0];
+        emit(*g, name, *idx);
+        if hits.len() > 1 {
+            eprintln!("(+{} more containing tags; pass -a for all)", hits.len() - 1);
         }
     }
 }

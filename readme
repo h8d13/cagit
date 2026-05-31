@@ -17,14 +17,20 @@ bf0c6e839c692142784caf07b523cd69442e57a5  commit  Linus Torvalds: Make "cat-file
 # remote no clone needed
 ./target/release/cagit https://github.com/git/git.git commit -se "cat" oldest 1
 HEAD 59ff4886a579f4bc91e976fe18590b9ae02c7a08
-filter  blob:none
-pack  108MiB
+filter  tree:0
+pack  33MiB
 bf0c6e839c692142784caf07b523cd69442e57a5  commit  Linus Torvalds: Make "cat-file" output the file contents to stdout.
+
+# earliest release (tag) whose history contains a commit. no clone.
+./target/release/cagit https://github.com/git/git.git contains bf0c6e839c692142784caf07b523cd69442e57a5 -s
+v0.99  a3eb250f996bf5e12376ec88622c4ccaabf20ea8  (gen 978)  Junio C Hamano: [PATCH] alternate object store and fsck
 
 -s = summary
 -e = exact word match, otherwise substring/regex
+-a = (contains) list every containing tag, earliest first
 
-when not searching blobs, filter=blob:none is negotiated automatically (~300MiB → ~108MiB).
+the leanest partial-clone filter is negotiated automatically: commit-only queries
+get filter=tree:0 (~300MiB → ~33MiB), tree queries get blob:none (~108MiB).
 output is pipe-friendly (full sha40 + kind). use -s to add a one-line summary.
 
 ---

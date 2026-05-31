@@ -3,6 +3,7 @@
 // with everything downstream queries need: packs, sha indexes per pack, DAG,
 // resolved HEAD, and loose-object store.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -76,8 +77,71 @@ pub fn resolve_head(git_dir: &Path) -> Option<String> {
     }
 }
 
-/// Auto-dispatches: URL -> remote fetch with filter=blob:none (commits + trees),
-/// else local clone (full pack on disk).
+/// Enumerate local tags as (tagname, target_sha). For annotated tags the target
+/// is the peeled commit when packed-refs carries a `^` peel line; lightweight
+/// tags resolve to the ref sha directly. Loose annotated tags that aren't peeled
+/// here keep their tag-object sha and simply won't match the commit DAG (run
+/// `git pack-refs` to peel). Best-effort, no object inflation.
+pub fn collect_tags(git_dir: &Path) -> Vec<(String, [u8; 20])> {
+    let mut out: Vec<(String, [u8; 20])> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // packed-refs: a `<sha> refs/tags/x` line, optionally followed by a
+    // `^<commit>` line giving the dereferenced commit for an annotated tag.
+    if let Ok(packed) = std::fs::read_to_string(git_dir.join("packed-refs")) {
+        let mut pending: Option<(String, [u8; 20])> = None;
+        for line in packed.lines() {
+            if line.starts_with('#') { continue; }
+            if let Some(peel) = line.strip_prefix('^') {
+                if let Some((name, _)) = pending.take() {
+                    if let Some(sha) = hex_to_sha(peel.trim()) {
+                        if seen.insert(name.clone()) { out.push((name, sha)); }
+                    }
+                }
+                continue;
+            }
+            // non-peel line: flush any pending (lightweight) tag, then parse this one.
+            if let Some((name, sha)) = pending.take() {
+                if seen.insert(name.clone()) { out.push((name, sha)); }
+            }
+            let mut it = line.split_ascii_whitespace();
+            if let (Some(s), Some(r)) = (it.next(), it.next()) {
+                if let Some(tag) = r.strip_prefix("refs/tags/") {
+                    if let Some(sha) = hex_to_sha(s) {
+                        pending = Some((tag.to_string(), sha));
+                    }
+                }
+            }
+        }
+        if let Some((name, sha)) = pending.take() {
+            if seen.insert(name.clone()) { out.push((name, sha)); }
+        }
+    }
+
+    // loose refs under refs/tags/** (recursive; tag names may contain '/').
+    let tagdir = git_dir.join("refs/tags");
+    let mut stack = vec![tagdir.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = dir.read_dir() else { continue };
+        for e in rd.filter_map(|e| e.ok()) {
+            let p = e.path();
+            if p.is_dir() { stack.push(p); continue; }
+            let Ok(rel) = p.strip_prefix(&tagdir) else { continue };
+            let name = rel.to_string_lossy().to_string();
+            if seen.contains(&name) { continue; }
+            if let Ok(s) = std::fs::read_to_string(&p) {
+                if let Some(sha) = hex_to_sha(s.trim()) {
+                    seen.insert(name.clone());
+                    out.push((name, sha));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Auto-dispatches: URL -> remote fetch with the leanest filter (tree:0 for
+/// commit-only queries), else local clone (full pack on disk).
 pub fn open_repo(repo_arg: &str) -> io::Result<OpenedRepo> {
     if repo_arg.starts_with("http://") || repo_arg.starts_with("https://") {
         open_remote_repo(repo_arg)

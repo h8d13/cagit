@@ -7,8 +7,9 @@
 // Response is pkt-line framed with sideband-64k multiplexing.
 // Strip framing, return raw PACK bytes for scan_objects_no_idx.
 //
-// If server advertises `filter` and caller doesn't need blobs, request
-// filter=blob:none. For git/git: ~300MB -> ~108MB.
+// If server advertises `filter`, request the leanest filter for the wanted
+// kinds: commits/tags only -> tree:0, trees-but-no-blobs -> blob:none.
+// For git/git: ~300MB -> ~108MB (blob:none); tree:0 is smaller still.
 //
 // Reference: git/Documentation/technical/pack-protocol.txt
 //            git/Documentation/technical/http-protocol.txt
@@ -19,6 +20,16 @@ use std::time::Duration;
 // kind_mask bit 2 = blob. If blob bit is unset and mask is non-zero, no blobs needed.
 fn needs_blobs(kind_mask: u8) -> bool {
     kind_mask == 0 || (kind_mask & 0b0100 != 0)
+}
+
+// Leanest partial-clone filter for the wanted kinds (server must advertise `filter`):
+//   commits/tags only (no tree bit) -> tree:0   (no trees, no blobs)
+//   trees needed, blobs not         -> blob:none
+//   blobs needed / all              -> None      (full pack)
+fn filter_spec(kind_mask: u8) -> Option<&'static str> {
+    if needs_blobs(kind_mask) { return None; }
+    if kind_mask & 0b0010 != 0 { return Some("blob:none"); }
+    Some("tree:0")
 }
 
 // Per-socket-operation timeouts (not total): bound idle / hung-connection time,
@@ -42,12 +53,12 @@ pub fn fetch_pack_with_head(url: &str, kind_mask: u8) -> io::Result<([u8; 20], V
     let (head_sha, caps) = discover_head(&agent, base)?;
     eprintln!("HEAD {}", hex40(&head_sha));
 
-    let use_filter = !needs_blobs(kind_mask) && caps.contains("filter");
-    if use_filter {
-        eprintln!("filter  blob:none");
+    let filter = if caps.contains("filter") { filter_spec(kind_mask) } else { None };
+    if let Some(f) = filter {
+        eprintln!("filter  {f}");
     }
 
-    let pack = request_pack(&agent, base, &head_sha, use_filter)?;
+    let pack = request_pack(&agent, base, &head_sha, filter)?;
     eprintln!("pack  {} bytes", pack.len());
     Ok((head_sha, pack))
 }
@@ -105,8 +116,8 @@ fn parse_all_refs(data: &[u8]) -> io::Result<([u8; 20], Vec<(String, [u8; 20])>)
 }
 
 // POST git-upload-pack, demux sideband, return raw pack bytes.
-fn request_pack(agent: &ureq::Agent, base: &str, sha: &[u8; 20], filter_blobs: bool) -> io::Result<Vec<u8>> {
-    let caps = if filter_blobs {
+fn request_pack(agent: &ureq::Agent, base: &str, sha: &[u8; 20], filter: Option<&str>) -> io::Result<Vec<u8>> {
+    let caps = if filter.is_some() {
         "side-band-64k ofs-delta no-progress filter"
     } else {
         "side-band-64k ofs-delta no-progress"
@@ -115,8 +126,8 @@ fn request_pack(agent: &ureq::Agent, base: &str, sha: &[u8; 20], filter_blobs: b
 
     let mut body = Vec::new();
     body.extend(pkt_encode(&want).as_bytes());
-    if filter_blobs {
-        body.extend(pkt_encode("filter blob:none\n").as_bytes());
+    if let Some(f) = filter {
+        body.extend(pkt_encode(&format!("filter {f}\n")).as_bytes());
     }
     body.extend(b"0000");
     body.extend(b"0009done\n");
