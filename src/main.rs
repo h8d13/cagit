@@ -731,10 +731,10 @@ fn run_dag(repo_arg: &str, sha_arg: Option<&str>) {
     let dag = &repo.dag;
 
     let n = dag.commits.len();
-    let roots = dag.parents.iter().filter(|p| p.is_empty()).count();
-    let leaves = dag.children.iter().filter(|c| c.is_empty()).count();
+    let roots  = (0..n).filter(|&i| dag.parent_count(i) == 0).count();
+    let leaves = (0..n).filter(|&i| dag.child_count(i) == 0).count();
     let max_gen = dag.generation.iter().copied().max().unwrap_or(0);
-    let merges = dag.parents.iter().filter(|p| p.len() > 1).count();
+    let merges = (0..n).filter(|&i| dag.parent_count(i) > 1).count();
     let loose = dag.loose_bodies.len();
 
     eprintln!("dag {}: {:?}", if repo.dag_cached { "loaded" } else { "built " }, t_dag);
@@ -764,8 +764,8 @@ fn run_dag(repo_arg: &str, sha_arg: Option<&str>) {
         eprintln!("---");
         eprintln!("commit:          {}", hex);
         eprintln!("generation:      {}", dag.generation[idx]);
-        eprintln!("parents:         {}", dag.parents[idx].len());
-        eprintln!("children:        {}", dag.children[idx].len());
+        eprintln!("parents:         {}", dag.parent_count(idx));
+        eprintln!("children:        {}", dag.child_count(idx));
         eprintln!("ancestors:       {} ({:?})", ancestors.len(), t_anc);
         eprintln!("descendants:     {} ({:?})", descendants.len(), t_desc);
         eprintln!("author_ts:       {}", c.author_ts);

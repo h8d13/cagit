@@ -128,6 +128,43 @@ impl ShaSet {
     pub fn len(&self) -> usize { self.slab.len() }
 }
 
+/// sha -> u32 map backed by the FFI hashmap. Same chained-slab as ShaIndex/ShaSet.
+pub struct ShaU32Map {
+    slab: Vec<ShaU32Entry>,
+    map: OffsetMap,
+}
+
+struct ShaU32Entry {
+    sha: [u8; 20],
+    val: u32,
+    next: u32,
+}
+
+impl ShaU32Map {
+    pub fn with_capacity(cap: usize) -> Self {
+        let mut map = OffsetMap::new(cap.next_power_of_two().max(16));
+        map.reserve(cap as u64);
+        Self { slab: Vec::with_capacity(cap), map }
+    }
+
+    pub fn insert(&mut self, sha: [u8; 20], val: u32) {
+        let k = sha_key(&sha);
+        let prev = self.map.get(k).unwrap_or(NO_NEXT);
+        self.map.set(k, self.slab.len() as u32);
+        self.slab.push(ShaU32Entry { sha, val, next: prev });
+    }
+
+    pub fn get(&self, sha: &[u8; 20]) -> Option<u32> {
+        let mut idx = self.map.get(sha_key(sha))?;
+        loop {
+            let e = &self.slab[idx as usize];
+            if e.sha == *sha { return Some(e.val); }
+            if e.next == NO_NEXT { return None; }
+            idx = e.next;
+        }
+    }
+}
+
 // In-memory store for loose objects: sha -> (kind, body). FFI-backed via the
 // same chained-slab pattern as ShaIndex/ShaSet.
 pub struct LooseStore {
